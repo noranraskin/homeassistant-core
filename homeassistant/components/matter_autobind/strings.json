@@ -1,0 +1,10 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Matter AutoBind",
+        "description": "Configure Matter AutoBind to automatically create direct device bindings from your automations."
+      }
+    }
+  }
+}
