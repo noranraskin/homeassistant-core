@@ -2,52 +2,36 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from typing import Any, cast
+from typing import Any
 
-import voluptuous as vol
-
-from homeassistant.components.sensor import DOMAIN as SENSOR_DOMAIN
-from homeassistant.const import CONF_ENTITY_ID
-from homeassistant.helpers import selector
-from homeassistant.helpers.schema_config_entry_flow import (
-    SchemaConfigFlowHandler,
-    SchemaFlowFormStep,
-    SchemaFlowMenuStep,
-)
+from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
 
 from .const import DOMAIN
 
-OPTIONS_SCHEMA = vol.Schema(
-    {
-        vol.Required(CONF_ENTITY_ID): selector.EntitySelector(
-            selector.EntitySelectorConfig(domain=SENSOR_DOMAIN)
-        ),
-    }
-)
 
-CONFIG_SCHEMA = vol.Schema(
-    {
-        vol.Required("name"): selector.TextSelector(),
-    }
-).extend(OPTIONS_SCHEMA.schema)
+class MatterAutoBindConfigFlow(ConfigFlow, domain=DOMAIN):
+    """Handle a config flow for Matter AutoBind.
 
-CONFIG_FLOW: dict[str, SchemaFlowFormStep | SchemaFlowMenuStep] = {
-    "user": SchemaFlowFormStep(CONFIG_SCHEMA)
-}
+    This integration requires no user input - it automatically discovers
+    Matter devices with client clusters and creates entities for them.
+    """
 
-OPTIONS_FLOW: dict[str, SchemaFlowFormStep | SchemaFlowMenuStep] = {
-    "init": SchemaFlowFormStep(OPTIONS_SCHEMA)
-}
+    VERSION = 1
 
+    async def async_step_user(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Handle the initial step.
 
-class ConfigFlowHandler(SchemaConfigFlowHandler, domain=DOMAIN):
-    """Handle a config or options flow for Matter AutoBind."""
+        The integration installs automatically without any user configuration.
+        Only one instance of this integration is allowed.
+        """
+        # Check if already configured
+        await self.async_set_unique_id(DOMAIN)
+        self._abort_if_unique_id_configured()
 
-    config_flow = CONFIG_FLOW
-    # TODO remove the options_flow if the integration does not have an options flow
-    options_flow = OPTIONS_FLOW
-
-    def async_config_entry_title(self, options: Mapping[str, Any]) -> str:
-        """Return config entry title."""
-        return cast(str, options["name"]) if "name" in options else ""
+        # Create entry immediately without asking for anything
+        return self.async_create_entry(
+            title="Matter AutoBind",
+            data={},
+        )

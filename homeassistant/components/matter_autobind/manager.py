@@ -19,6 +19,10 @@ from .store import BindingEntryDict, MatterBindingStore
 if TYPE_CHECKING:
     from homeassistant.config_entries import ConfigEntry
 
+from homeassistant.components.matter.helpers import get_matter
+
+from .discovery import async_discover_client_cluster_entities
+
 
 # Matter domain constant
 MATTER_DOMAIN = "matter"
@@ -78,6 +82,9 @@ class MatterBindingManager:
 
         # Perform initial scan
         await self.async_scan_automations()
+
+        # Discover and create client cluster entities
+        await self.async_discover_client_clusters()
 
         LOGGER.info("Matter AutoBind Manager setup complete")
 
@@ -353,3 +360,85 @@ class MatterBindingManager:
         _ = CLUSTER_ID_BINDING  # Reference to avoid unused import
         LOGGER.debug("Checking binding cluster support for node %d (stub)", node_id)
         return False
+
+    async def async_discover_client_clusters(self) -> None:
+        """Discover Matter nodes with client clusters and create entities.
+
+        This scans all Matter nodes for endpoints that have client cluster
+        device types (like OnOffLightSwitch, DimmerSwitch) but don't already
+        have entities from the official matter integration.
+        """
+        LOGGER.info("Starting client cluster discovery")
+
+        # Check if matter integration is loaded
+        if MATTER_DOMAIN not in self._hass.data:
+            LOGGER.warning(
+                "Matter integration not loaded, skipping client cluster discovery"
+            )
+            return
+
+        # Get the matter adapter
+        try:
+            matter = get_matter(self._hass)
+        except KeyError:
+            LOGGER.warning("Matter integration not available")
+            return
+
+        # Get runtime data for entity callbacks
+        runtime_data = self._config_entry.runtime_data
+
+        # Collect entities to add by platform
+        switch_entities: list = []
+        light_entities: list = []
+
+        # Get all nodes from the matter client
+        for node in matter.matter_client.get_nodes():
+            LOGGER.debug(
+                "Checking node %d for client clusters (endpoints: %s)",
+                node.node_id,
+                list(node.endpoints.keys()),
+            )
+
+            for endpoint in node.endpoints.values():
+                # Skip root endpoint (0)
+                if endpoint.endpoint_id == 0:
+                    continue
+
+                # Discover client cluster entities for this endpoint
+                for entity_info in async_discover_client_cluster_entities(
+                    endpoint, self._entity_registry
+                ):
+                    LOGGER.info(
+                        "Creating %s entity for node %d endpoint %d",
+                        entity_info.platform,
+                        node.node_id,
+                        endpoint.endpoint_id,
+                    )
+
+                    # Create the entity
+                    entity = entity_info.entity_class(
+                        matter.matter_client,
+                        endpoint,
+                        entity_info,
+                    )
+
+                    # Add to appropriate list
+                    if entity_info.platform.value == "switch":
+                        switch_entities.append(entity)
+                    elif entity_info.platform.value == "light":
+                        light_entities.append(entity)
+
+        # Add entities via platform callbacks
+        if switch_entities and runtime_data.switch_add_entities:
+            LOGGER.info("Adding %d switch entities", len(switch_entities))
+            runtime_data.switch_add_entities(switch_entities)
+
+        if light_entities and runtime_data.light_add_entities:
+            LOGGER.info("Adding %d light entities", len(light_entities))
+            runtime_data.light_add_entities(light_entities)
+
+        LOGGER.info(
+            "Client cluster discovery complete: %d switch, %d light entities",
+            len(switch_entities),
+            len(light_entities),
+        )
