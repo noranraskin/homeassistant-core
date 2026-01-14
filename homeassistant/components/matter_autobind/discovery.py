@@ -20,7 +20,6 @@ if TYPE_CHECKING:
 from .light import ClientClusterLight, ClientLightEntityDescription
 from .switch import ClientClusterSwitch, ClientSwitchEntityDescription
 
-
 # Client device types - devices that send commands rather than receive them
 # These have the Binding cluster and client-side clusters
 CLIENT_DEVICE_TYPES: tuple[type, ...] = (
