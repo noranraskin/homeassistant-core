@@ -6,13 +6,15 @@ import contextlib
 from typing import TYPE_CHECKING
 
 from matter_server.client.models import device_types
-from matter_server.common.models import APICommand
+from matter_server.common.models import EventType
 
 from homeassistant.components.automation import (
+    DATA_COMPONENT,
     DOMAIN as AUTOMATION_DOMAIN,
     devices_in_automation,
     entities_in_automation,
 )
+from homeassistant.const import CONF_DEVICE_ID, CONF_ENTITY_ID, CONF_PLATFORM
 from homeassistant.core import (
     CALLBACK_TYPE,
     Event,
@@ -33,7 +35,10 @@ from .store import AclEntryDict, BindingEntryDict, EligibilityStatus, MatterBind
 if TYPE_CHECKING:
     from homeassistant.config_entries import ConfigEntry
 
-from homeassistant.components.matter.helpers import get_matter
+from homeassistant.components.matter.helpers import (
+    get_matter,
+    get_node_from_device_entry,
+)
 
 from .discovery import async_discover_client_cluster_entities
 
@@ -103,6 +108,9 @@ class MatterBindingManager:
         # Subscribe to automation events (creation and updates)
         self._subscribe_to_automation_events()
 
+        # Subscribe to Matter node events for new device discovery
+        self._subscribe_to_matter_node_events()
+
         LOGGER.info("Matter AutoBind Manager setup complete")
 
     async def async_shutdown(self) -> None:
@@ -155,6 +163,41 @@ class MatterBindingManager:
         )
 
     @callback
+    def _subscribe_to_matter_node_events(self) -> None:
+        """Subscribe to Matter node events for new device discovery.
+
+        When a new Matter device is added, we discover any client cluster
+        entities that may need to be created.
+        """
+        LOGGER.debug("Subscribing to Matter node events")
+
+        try:
+            matter = get_matter(self._hass)
+            matter_client = matter.matter_client
+        except (KeyError, StopIteration):
+            LOGGER.debug(
+                "Matter integration not available, skipping node event subscription"
+            )
+            return
+
+        def handle_node_added(event: EventType, node) -> None:
+            """Handle a new Matter node being added."""
+            LOGGER.info(
+                "Matter node %d added, discovering client cluster entities",
+                node.node_id,
+            )
+            # Schedule discovery for the new node
+            self._hass.async_create_task(
+                self._async_discover_client_clusters_for_node(node)
+            )
+
+        unsub = matter_client.subscribe_events(
+            callback=handle_node_added, event_filter=EventType.NODE_ADDED
+        )
+        self._unsub_automation_listeners.append(unsub)
+        LOGGER.info("Subscribed to Matter node events")
+
+    @callback
     def _handle_automation_added(self, event: Event[EventStateChangedData]) -> None:
         """Handle a new automation being created.
 
@@ -195,11 +238,48 @@ class MatterBindingManager:
         old_state = event.data["old_state"]
         new_state = event.data["new_state"]
 
-        # Handle deletion - clean up ACLs
+        # Handle deletion - clean up ACLs and bindings
         if new_state is None:
-            LOGGER.info("Automation %s was deleted, cleaning up ACLs", entity_id)
+            LOGGER.info(
+                "Automation %s was deleted, cleaning up ACLs and bindings", entity_id
+            )
             self._hass.async_create_task(
                 self._async_handle_automation_deleted(entity_id)
+            )
+            return
+
+        # Skip new automations - they're handled by _handle_automation_added
+        if old_state is None:
+            LOGGER.debug(
+                "Automation %s is new, skipping update handler (handled by add handler)",
+                entity_id,
+            )
+            return
+
+        # Handle disabled - remove bindings only (keep ACLs for re-enabling)
+        if (
+            old_state is not None
+            and old_state.state == "on"
+            and new_state.state == "off"
+        ):
+            LOGGER.info(
+                "Automation %s was disabled, removing bindings (keeping ACLs)",
+                entity_id,
+            )
+            self._hass.async_create_task(
+                self._async_handle_automation_disabled(entity_id)
+            )
+            return
+
+        # Handle enabled - recreate bindings
+        if (
+            old_state is not None
+            and old_state.state == "off"
+            and new_state.state == "on"
+        ):
+            LOGGER.info("Automation %s was enabled, recreating bindings", entity_id)
+            self._hass.async_create_task(
+                self._async_handle_automation_enabled(entity_id)
             )
             return
 
@@ -224,12 +304,14 @@ class MatterBindingManager:
     async def _async_handle_automation_deleted(self, automation_id: str) -> None:
         """Handle an automation being deleted.
 
-        Cleans up any ACL entries created for this automation.
+        Cleans up both ACL entries and bindings created for this automation.
 
         Args:
             automation_id: The entity_id of the deleted automation.
         """
-        LOGGER.info("Cleaning up ACL entries for deleted automation: %s", automation_id)
+        LOGGER.info(
+            "Cleaning up ACLs and bindings for deleted automation: %s", automation_id
+        )
 
         # Get and remove ACL entries from store
         acl_entries = await self._store.async_remove_acls_for_automation(automation_id)
@@ -244,11 +326,79 @@ class MatterBindingManager:
                 len(acl_entries),
                 automation_id,
             )
-        else:
-            LOGGER.debug("No ACL entries to clean up for automation %s", automation_id)
+
+        # Get and remove bindings from store
+        bindings = await self._store.async_remove_bindings_for_automation(automation_id)
+
+        # Remove bindings from devices
+        if bindings:
+            await self._async_remove_bindings_from_devices(automation_id, bindings)
+            LOGGER.info(
+                "Cleaned up %d bindings for automation %s",
+                len(bindings),
+                automation_id,
+            )
 
         # Also clear scanned status and eligibility result
         await self._store.async_clear_scanned_automation(automation_id)
+
+    async def _async_handle_automation_disabled(self, automation_id: str) -> None:
+        """Handle an automation being disabled.
+
+        Removes bindings but keeps ACLs for potential re-enabling.
+
+        Args:
+            automation_id: The entity_id of the disabled automation.
+        """
+        LOGGER.info("Removing bindings for disabled automation: %s", automation_id)
+
+        # Get and remove bindings from store
+        bindings = await self._store.async_remove_bindings_for_automation(automation_id)
+
+        # Remove bindings from devices
+        if bindings:
+            await self._async_remove_bindings_from_devices(automation_id, bindings)
+            LOGGER.info(
+                "Removed %d bindings for disabled automation %s",
+                len(bindings),
+                automation_id,
+            )
+        else:
+            LOGGER.debug("No bindings to remove for automation %s", automation_id)
+
+    async def _async_handle_automation_enabled(self, automation_id: str) -> None:
+        """Handle an automation being re-enabled.
+
+        Recreates bindings. ACLs should still exist from initial setup.
+
+        Args:
+            automation_id: The entity_id of the enabled automation.
+        """
+        LOGGER.info("Recreating bindings for enabled automation: %s", automation_id)
+
+        # Get eligibility result to find trigger/action entities
+        result = self._store.get_eligibility_result(automation_id)
+        if result is None:
+            LOGGER.warning(
+                "No eligibility result found for automation %s, cannot recreate bindings",
+                automation_id,
+            )
+            return
+
+        if result["status"] != EligibilityStatus.ELIGIBLE:
+            LOGGER.debug(
+                "Automation %s is not eligible, skipping binding recreation",
+                automation_id,
+            )
+            return
+
+        trigger_entities = result["trigger_entities"]
+        action_entities = result["action_entities"]
+
+        # Recreate bindings
+        await self._async_create_bindings_for_automation(
+            automation_id, trigger_entities, action_entities
+        )
 
     async def _async_check_and_log_automation(
         self, automation_id: str, is_new: bool
@@ -307,6 +457,11 @@ class MatterBindingManager:
 
             # Create ACL entries for this automation
             await self._async_create_acl_for_automation(
+                automation_id, trigger_entities, action_entities
+            )
+
+            # Create bindings on trigger devices to target devices
+            await self._async_create_bindings_for_automation(
                 automation_id, trigger_entities, action_entities
             )
         else:
@@ -378,10 +533,14 @@ class MatterBindingManager:
                     )
 
                     # Check if we already have an ACL entry for this source node
-                    # ACL entries have 'subjects' field containing node IDs
+                    # ACL entries may be dicts with numeric keys or dataclass objects
                     already_exists = False
                     for acl_entry in current_acl_list:
-                        subjects = acl_entry.get("subjects", [])
+                        # Handle both dict format ("3" key) and dataclass format (subjects attr)
+                        if isinstance(acl_entry, dict):
+                            subjects = acl_entry.get("3", []) or []
+                        else:
+                            subjects = getattr(acl_entry, "subjects", []) or []
                         if source_node_id in subjects:
                             LOGGER.debug(
                                 "ACL entry already exists for source node %d on target %d",
@@ -394,42 +553,113 @@ class MatterBindingManager:
                     if already_exists:
                         continue
 
-                    # Create new ACL entry granting Operate privilege (3) to the source node
-                    # ACL entry structure:
-                    # - privilege: 3 (Operate - can invoke commands)
-                    # - authMode: 2 (CASE - standard auth)
-                    # - subjects: list of node IDs
-                    # - targets: None (all endpoints/clusters)
+                    # Get fabric_id from server_info (required for ACL entries)
+                    server_info = matter_client.server_info
+                    if server_info is None:
+                        LOGGER.error("Matter server info not available")
+                        continue
+                    fabric_id = server_info.fabric_id
+
+                    # Create new ACL entry using raw TLV dict format
+                    # (matching the format used by the working binding script)
+                    # TLV keys: "1"=privilege, "2"=authMode, "3"=subjects, "4"=targets, "254"=fabricIndex
                     new_acl_entry = {
-                        "privilege": 3,  # Operate
-                        "authMode": 2,  # CASE
-                        "subjects": [source_node_id],
-                        "targets": None,  # All endpoints/clusters
+                        "254": fabric_id,  # fabricIndex
+                        "1": 3,  # Operate privilege
+                        "2": 2,  # CASE authMode
+                        "3": [source_node_id],  # subjects
+                        "4": None,  # targets (None = all endpoints/clusters)
                     }
 
-                    # Append to existing ACL list
-                    updated_acl_list = [*current_acl_list, new_acl_entry]
-                    acl_index = len(current_acl_list)  # Index of new entry
+                    LOGGER.debug(
+                        "New ACL entry to add: %s",
+                        new_acl_entry,
+                    )
 
-                    # Write updated ACL using the Matter server API
-                    await matter_client.send_command(
-                        APICommand.SET_ACL_ENTRY,
+                    # Filter out invalid/incomplete ACL entries before writing
+                    # Valid ACL entries must have privilege ('1') and authMode ('2')
+                    def is_valid_acl_entry(entry):
+                        if isinstance(entry, dict):
+                            has_privilege = "1" in entry
+                            has_auth_mode = "2" in entry
+                            return has_privilege and has_auth_mode
+                        # For dataclass entries, check for privilege attribute
+                        return hasattr(entry, "privilege") and hasattr(
+                            entry, "authMode"
+                        )
+
+                    valid_acl_entries = [
+                        e for e in current_acl_list if is_valid_acl_entry(e)
+                    ]
+
+                    if len(valid_acl_entries) < len(current_acl_list):
+                        LOGGER.warning(
+                            "Filtered out %d invalid ACL entries from node %d",
+                            len(current_acl_list) - len(valid_acl_entries),
+                            target_node_id,
+                        )
+
+                    # Append new entry to valid entries
+                    updated_acl_list = [*valid_acl_entries, new_acl_entry]
+
+                    LOGGER.debug(
+                        "Full ACL list to write (before): %s",
+                        current_acl_list,
+                    )
+                    LOGGER.debug(
+                        "Full ACL list to write (after): %s",
+                        updated_acl_list,
+                    )
+
+                    # Write ACL using write_attribute method
+                    write_response = await matter_client.write_attribute(
                         node_id=target_node_id,
-                        entry=updated_acl_list,
+                        attribute_path="0/31/0",  # Endpoint 0, AccessControl cluster (31), Acl attr (0)
+                        value=updated_acl_list,
                     )
 
-                    LOGGER.info(
-                        "Created ACL entry on node %d granting access to node %d",
+                    LOGGER.debug(
+                        "ACL write response for node %d: %s",
                         target_node_id,
-                        source_node_id,
+                        write_response,
                     )
+
+                    # Verify by re-reading ACL
+                    verify_acls = await matter_client.read_attribute(
+                        target_node_id, acl_path
+                    )
+                    verify_acl_list = verify_acls.get(acl_path, [])
+                    LOGGER.info(
+                        "ACL VERIFICATION - Node %d now has %d ACL entries (was %d)",
+                        target_node_id,
+                        len(verify_acl_list),
+                        len(current_acl_list),
+                    )
+                    LOGGER.debug(
+                        "Verified ACL on node %d: %s",
+                        target_node_id,
+                        verify_acl_list,
+                    )
+
+                    if len(verify_acl_list) <= len(current_acl_list):
+                        LOGGER.error(
+                            "ACL WRITE FAILED! Entry was not added to node %d",
+                            target_node_id,
+                        )
+                    else:
+                        LOGGER.info(
+                            "Created ACL entry on node %d granting access to node %d",
+                            target_node_id,
+                            source_node_id,
+                        )
 
                     # Store ACL reference for cleanup
                     acl_entry_dict: AclEntryDict = {
                         "target_node_id": target_node_id,
                         "source_node_id": source_node_id,
                         "endpoint_id": 0,
-                        "acl_index": acl_index,
+                        "acl_index": len(updated_acl_list)
+                        - 1,  # Index of the new entry
                     }
                     await self._store.async_add_acl(automation_id, acl_entry_dict)
 
@@ -481,7 +711,11 @@ class MatterBindingManager:
                 updated_acl_list = []
                 removed_count = 0
                 for existing_acl in current_acl_list:
-                    subjects = existing_acl.get("subjects", [])
+                    # Handle both dict format (TLV keys) and dataclass format
+                    if isinstance(existing_acl, dict):
+                        subjects = existing_acl.get("3", []) or []
+                    else:
+                        subjects = getattr(existing_acl, "subjects", []) or []
                     if source_node_id in subjects:
                         # Remove entries that grant access to this source
                         LOGGER.debug(
@@ -495,10 +729,10 @@ class MatterBindingManager:
 
                 if removed_count > 0:
                     # Write updated ACL
-                    await matter_client.send_command(
-                        APICommand.SET_ACL_ENTRY,
+                    await matter_client.write_attribute(
                         node_id=target_node_id,
-                        entry=updated_acl_list,
+                        attribute_path=acl_path,
+                        value=updated_acl_list,
                     )
                     LOGGER.info(
                         "Removed %d ACL entries from node %d",
@@ -510,6 +744,329 @@ class MatterBindingManager:
                 LOGGER.error(
                     "Failed to remove ACL entry from node %d: %s",
                     target_node_id,
+                    err,
+                )
+
+    async def _async_create_bindings_for_automation(
+        self,
+        automation_id: str,
+        trigger_entities: list[str],
+        action_entities: list[str],
+    ) -> None:
+        """Create bindings on trigger devices pointing to target devices.
+
+        For each trigger device, creates bindings to ALL target devices.
+
+        Args:
+            automation_id: The entity_id of the automation.
+            trigger_entities: List of trigger entity IDs (source devices).
+            action_entities: List of action entity IDs (target devices).
+        """
+        LOGGER.info("Creating bindings for automation %s", automation_id)
+
+        try:
+            matter = get_matter(self._hass)
+            matter_client = matter.matter_client
+        except (KeyError, StopIteration):
+            LOGGER.warning("Matter integration not available, cannot create bindings")
+            return
+
+        # Get node IDs for trigger and action entities
+        trigger_node_ids = await self._get_node_ids_for_entities(trigger_entities)
+        action_node_ids = await self._get_node_ids_for_entities(action_entities)
+
+        if not trigger_node_ids:
+            LOGGER.warning(
+                "Could not find node IDs for trigger entities: %s", trigger_entities
+            )
+            return
+
+        if not action_node_ids:
+            LOGGER.warning(
+                "Could not find node IDs for action entities: %s", action_entities
+            )
+            return
+
+        LOGGER.debug("Creating bindings - Trigger node IDs: %s", trigger_node_ids)
+        LOGGER.debug("Creating bindings - Action node IDs: %s", action_node_ids)
+
+        # For each trigger device, add bindings to ALL target devices
+        for source_node_id in trigger_node_ids:
+            try:
+                # Read current bindings from the trigger device
+                # Binding cluster (30) is typically on endpoint 1 for switches
+                binding_path = (
+                    "1/30/0"  # Endpoint 1, Binding cluster (30), Binding attribute (0)
+                )
+
+                current_bindings: list[dict] = []
+                binding_read_success = False
+
+                # Try endpoint 1 first
+                try:
+                    current_bindings_resp = await matter_client.read_attribute(
+                        source_node_id, binding_path
+                    )
+                    raw_bindings = current_bindings_resp.get(binding_path, [])
+
+                    # Check if response is an error dict (device doesn't support binding)
+                    if isinstance(raw_bindings, dict):
+                        if raw_bindings.get("TLVValue") is None or raw_bindings.get(
+                            "Reason"
+                        ):
+                            LOGGER.debug(
+                                "Node %d binding cluster error on endpoint 1: %s",
+                                source_node_id,
+                                raw_bindings.get("Reason", "Unknown error"),
+                            )
+                        else:
+                            binding_read_success = True
+                    elif isinstance(raw_bindings, list):
+                        current_bindings = raw_bindings
+                        binding_read_success = True
+                except (HomeAssistantError, OSError, ValueError):
+                    LOGGER.debug(
+                        "Failed to read bindings from endpoint 1 on node %d",
+                        source_node_id,
+                    )
+
+                # Try endpoint 0 if endpoint 1 failed
+                if not binding_read_success:
+                    binding_path = "0/30/0"
+                    try:
+                        current_bindings_resp = await matter_client.read_attribute(
+                            source_node_id, binding_path
+                        )
+                        raw_bindings = current_bindings_resp.get(binding_path, [])
+
+                        # Check if response is an error dict
+                        if isinstance(raw_bindings, dict):
+                            if raw_bindings.get("TLVValue") is None or raw_bindings.get(
+                                "Reason"
+                            ):
+                                LOGGER.warning(
+                                    "Node %d does not support binding cluster: %s",
+                                    source_node_id,
+                                    raw_bindings.get("Reason", "Unknown error"),
+                                )
+                                continue
+                        elif isinstance(raw_bindings, list):
+                            current_bindings = raw_bindings
+                            binding_read_success = True
+                    except (HomeAssistantError, OSError, ValueError):
+                        LOGGER.warning(
+                            "Could not read bindings from node %d, device may not support binding",
+                            source_node_id,
+                        )
+                        continue
+
+                if not binding_read_success:
+                    LOGGER.warning(
+                        "Could not read bindings from node %d - no valid binding cluster found",
+                        source_node_id,
+                    )
+                    continue
+
+                LOGGER.debug(
+                    "Current bindings on node %d: %s",
+                    source_node_id,
+                    current_bindings,
+                )
+
+                # Build new bindings list - add bindings to all target devices
+                new_bindings = list(current_bindings)
+                endpoint_id = int(binding_path.split("/")[0])
+
+                for target_node_id in action_node_ids:
+                    # Check if binding already exists
+                    # Handle both dict format (TLV keys) and dataclass format
+                    binding_exists = False
+                    for existing_binding in current_bindings:
+                        if isinstance(existing_binding, dict):
+                            # Key "1" is node in TLV encoding
+                            existing_node = existing_binding.get("1")
+                        else:
+                            existing_node = getattr(existing_binding, "node", None)
+                        if existing_node == target_node_id:
+                            binding_exists = True
+                            break
+
+                    if binding_exists:
+                        LOGGER.debug(
+                            "Binding already exists on node %d to target %d",
+                            source_node_id,
+                            target_node_id,
+                        )
+                        continue
+
+                    # Get fabric_id from server_info (required for binding entries)
+                    server_info = matter_client.server_info
+                    if server_info is None:
+                        LOGGER.error("Matter server info not available")
+                        continue
+                    fabric_id = server_info.fabric_id
+
+                    # Create new binding entry using raw TLV dict format
+                    # (matching the format used by the working binding script)
+                    # TLV keys: "1"=node, "3"=endpoint, "4"=cluster, "254"=fabricIndex
+                    new_binding = {
+                        "254": fabric_id,  # fabricIndex
+                        "1": target_node_id,  # node
+                        "3": 1,  # endpoint (typically 1 for lights)
+                        "4": None,  # cluster (None = all clusters, like the working script)
+                    }
+                    new_bindings.append(new_binding)
+
+                    # Store binding reference for cleanup
+                    binding_entry: BindingEntryDict = {
+                        "client_node_id": source_node_id,
+                        "client_endpoint": endpoint_id,
+                        "target_node_id": target_node_id,
+                        "target_endpoint": 1,
+                        "clusters": [],
+                    }
+                    await self._store.async_add_binding(automation_id, binding_entry)
+
+                    LOGGER.info(
+                        "Adding binding on node %d to target node %d",
+                        source_node_id,
+                        target_node_id,
+                    )
+
+                # Write updated bindings back to device using WRITE_ATTRIBUTE
+                if len(new_bindings) > len(current_bindings):
+                    LOGGER.debug(
+                        "Binding list to write (before): %s",
+                        current_bindings,
+                    )
+                    LOGGER.debug(
+                        "Binding list to write (after): %s",
+                        new_bindings,
+                    )
+
+                    write_response = await matter_client.write_attribute(
+                        node_id=source_node_id,
+                        attribute_path=binding_path,  # e.g., "1/30/0"
+                        value=new_bindings,
+                    )
+
+                    LOGGER.debug(
+                        "Binding write response for node %d: %s",
+                        source_node_id,
+                        write_response,
+                    )
+
+                    # Verify by re-reading bindings
+                    verify_bindings_resp = await matter_client.read_attribute(
+                        source_node_id, binding_path
+                    )
+                    verify_bindings = verify_bindings_resp.get(binding_path, [])
+                    LOGGER.info(
+                        "BINDING VERIFICATION - Node %d now has %d bindings (was %d)",
+                        source_node_id,
+                        len(verify_bindings),
+                        len(current_bindings),
+                    )
+                    LOGGER.debug(
+                        "Verified bindings on node %d: %s",
+                        source_node_id,
+                        verify_bindings,
+                    )
+
+                    if len(verify_bindings) <= len(current_bindings):
+                        LOGGER.error(
+                            "BINDING WRITE FAILED! Entry was not added to node %d",
+                            source_node_id,
+                        )
+                    else:
+                        LOGGER.info(
+                            "Created %d new bindings on node %d",
+                            len(new_bindings) - len(current_bindings),
+                            source_node_id,
+                        )
+
+            except (HomeAssistantError, OSError, ValueError) as err:
+                LOGGER.error(
+                    "Failed to create bindings on node %d: %s",
+                    source_node_id,
+                    err,
+                )
+
+    async def _async_remove_bindings_from_devices(
+        self,
+        automation_id: str,
+        bindings: list[BindingEntryDict],
+    ) -> None:
+        """Remove bindings from Matter devices.
+
+        Args:
+            automation_id: The entity_id of the automation (for logging).
+            bindings: List of binding entries to remove.
+        """
+        LOGGER.info(
+            "Removing %d bindings for automation %s",
+            len(bindings),
+            automation_id,
+        )
+
+        try:
+            matter = get_matter(self._hass)
+            matter_client = matter.matter_client
+        except (KeyError, StopIteration):
+            LOGGER.warning("Matter integration not available, cannot remove bindings")
+            return
+
+        # Group bindings by source node for efficiency
+        bindings_by_node: dict[int, list[BindingEntryDict]] = {}
+        for binding in bindings:
+            source_node_id = binding["client_node_id"]
+            if source_node_id not in bindings_by_node:
+                bindings_by_node[source_node_id] = []
+            bindings_by_node[source_node_id].append(binding)
+
+        for source_node_id, node_bindings in bindings_by_node.items():
+            endpoint_id = node_bindings[0]["client_endpoint"]
+            target_node_ids_to_remove = {b["target_node_id"] for b in node_bindings}
+
+            try:
+                # Read current bindings
+                binding_path = f"{endpoint_id}/30/0"
+                current_bindings_resp = await matter_client.read_attribute(
+                    source_node_id, binding_path
+                )
+                current_bindings = current_bindings_resp.get(binding_path, [])
+
+                # Filter out bindings to the target nodes
+                # Handle both dict format (TLV keys) and dataclass format
+                def get_binding_node(b):
+                    if isinstance(b, dict):
+                        return b.get("1")
+                    return getattr(b, "node", None)
+
+                updated_bindings = [
+                    b
+                    for b in current_bindings
+                    if get_binding_node(b) not in target_node_ids_to_remove
+                ]
+
+                removed_count = len(current_bindings) - len(updated_bindings)
+                if removed_count > 0:
+                    # Write updated bindings
+                    await matter_client.write_attribute(
+                        node_id=source_node_id,
+                        attribute_path=binding_path,
+                        value=updated_bindings,
+                    )
+                    LOGGER.info(
+                        "Removed %d bindings from node %d",
+                        removed_count,
+                        source_node_id,
+                    )
+
+            except (HomeAssistantError, OSError, ValueError) as err:
+                LOGGER.error(
+                    "Failed to remove bindings from node %d: %s",
+                    source_node_id,
                     err,
                 )
 
@@ -704,53 +1261,100 @@ class MatterBindingManager:
                 f"Automation {automation_id} not found",
             )
 
-        # Get the automation's config to check for conditions
-        # We need to access the automation component to get the raw config
-        automations = self._hass.data.get(AUTOMATION_DOMAIN, {})
-        # Find the automation entity in the component (reserved for future use)
-        # Currently we check conditions via referenced entities/devices
-        _ = automations  # Silence unused variable warning
+        # Access the automation entity directly to get separate trigger/action references
 
-        # Check for conditions - we can infer from the state attributes
-        # If the automation has complex logic, it's not suitable for binding
-        # For now, we'll check the referenced entities/devices
+        automation_entity = None
+        if DATA_COMPONENT in self._hass.data:
+            automation_entity = self._hass.data[DATA_COMPONENT].get_entity(
+                automation_id
+            )
 
-        # Get referenced entities (actions)
-        referenced_entities = await self._get_automation_referenced_entities(
-            automation_id
+        if automation_entity is None:
+            return (
+                False,
+                EligibilityStatus.NOT_CHECKED,
+                [],
+                [],
+                f"Could not access automation entity {automation_id}",
+            )
+
+        # Get action entities from action_script
+        # These are the entities that the automation ACTS ON (targets)
+        action_referenced_entities = list(
+            automation_entity.action_script.referenced_entities
+        )
+        action_referenced_devices = list(
+            automation_entity.action_script.referenced_devices
         )
 
-        # Get referenced devices
-        referenced_devices = await self._get_automation_referenced_devices(
-            automation_id
-        )
+        # Get trigger entities from trigger config
+        # These are the entities that TRIGGER the automation (sources)
+        trigger_referenced_entities: list[str] = []
+        trigger_referenced_devices: list[str] = []
 
-        LOGGER.debug("Referenced entities: %s", referenced_entities)
-        LOGGER.debug("Referenced devices: %s", referenced_devices)
+        # Check if automation has _trigger_config (AutomationEntity has it, UnavailableAutomationEntity doesn't)
+        if hasattr(automation_entity, "_trigger_config"):
+            for trigger_conf in automation_entity._trigger_config:
+                # Extract entities from trigger
+                platform = trigger_conf.get(CONF_PLATFORM)
+                if platform in ("state", "numeric_state"):
+                    entity_ids = trigger_conf.get(CONF_ENTITY_ID, [])
+                    if isinstance(entity_ids, str):
+                        entity_ids = [entity_ids]
+                    trigger_referenced_entities.extend(entity_ids)
+                elif platform == "device":
+                    device_id = trigger_conf.get(CONF_DEVICE_ID)
+                    if device_id:
+                        if isinstance(device_id, list):
+                            trigger_referenced_devices.extend(device_id)
+                        else:
+                            trigger_referenced_devices.append(device_id)
+                    # Also check for entity_id in device triggers
+                    entity_id = trigger_conf.get(CONF_ENTITY_ID)
+                    if entity_id:
+                        if isinstance(entity_id, list):
+                            trigger_referenced_entities.extend(entity_id)
+                        else:
+                            trigger_referenced_entities.append(entity_id)
 
-        # Check if we have both trigger and action devices
-        # For simplicity, the first Matter device found is the trigger,
-        # and the second is the action target
+        LOGGER.debug("Action entities: %s", action_referenced_entities)
+        LOGGER.debug("Action devices: %s", action_referenced_devices)
+        LOGGER.debug("Trigger entities: %s", trigger_referenced_entities)
+        LOGGER.debug("Trigger devices: %s", trigger_referenced_devices)
 
-        all_matter_entities: list[str] = []
-
-        # Check entities
-        for entity_id in referenced_entities:
+        # Convert trigger devices to entities
+        trigger_matter_entities: list[str] = []
+        for entity_id in trigger_referenced_entities:
             if self._is_matter_entity(entity_id):
-                all_matter_entities.append(entity_id)
-                LOGGER.debug("  Matter entity: %s", entity_id)
+                if entity_id not in trigger_matter_entities:
+                    trigger_matter_entities.append(entity_id)
+                    LOGGER.debug("  Trigger Matter entity: %s", entity_id)
 
-        # Check devices
-        for device_id in referenced_devices:
+        for device_id in trigger_referenced_devices:
             device_matter_entities = self._get_matter_entities_for_device(device_id)
             for entity_id in device_matter_entities:
-                if entity_id not in all_matter_entities:
-                    all_matter_entities.append(entity_id)
-                    LOGGER.debug("  Matter entity (via device): %s", entity_id)
+                if entity_id not in trigger_matter_entities:
+                    trigger_matter_entities.append(entity_id)
+                    LOGGER.debug("  Trigger Matter entity (via device): %s", entity_id)
 
-        # We need at least 2 Matter entities (one for trigger, one for action)
-        if len(all_matter_entities) < 2:
-            if len(all_matter_entities) == 0:
+        # Convert action devices to entities
+        action_matter_entities: list[str] = []
+        for entity_id in action_referenced_entities:
+            if self._is_matter_entity(entity_id):
+                if entity_id not in action_matter_entities:
+                    action_matter_entities.append(entity_id)
+                    LOGGER.debug("  Action Matter entity: %s", entity_id)
+
+        for device_id in action_referenced_devices:
+            device_matter_entities = self._get_matter_entities_for_device(device_id)
+            for entity_id in device_matter_entities:
+                if entity_id not in action_matter_entities:
+                    action_matter_entities.append(entity_id)
+                    LOGGER.debug("  Action Matter entity (via device): %s", entity_id)
+
+        # Validate we have both trigger and action Matter entities
+        if not trigger_matter_entities:
+            if not action_matter_entities:
                 return (
                     False,
                     EligibilityStatus.INELIGIBLE_NO_MATTER_TRIGGER,
@@ -760,16 +1364,24 @@ class MatterBindingManager:
                 )
             return (
                 False,
-                EligibilityStatus.INELIGIBLE_NO_MATTER_ACTION,
-                all_matter_entities,
+                EligibilityStatus.INELIGIBLE_NO_MATTER_TRIGGER,
                 [],
-                f"Only {len(all_matter_entities)} Matter device found, need at least 2 (trigger + action)",
+                action_matter_entities,
+                "No Matter devices found in automation triggers",
             )
 
-        # For now, assume first entity is trigger, rest are actions
-        # TODO: Analyze the actual trigger/action structure for accuracy
-        trigger_entities = [all_matter_entities[0]]
-        action_entities = all_matter_entities[1:]
+        if not action_matter_entities:
+            return (
+                False,
+                EligibilityStatus.INELIGIBLE_NO_MATTER_ACTION,
+                trigger_matter_entities,
+                [],
+                "No Matter devices found in automation actions",
+            )
+
+        # Set properly extracted trigger and action entities
+        trigger_entities = trigger_matter_entities
+        action_entities = action_matter_entities
 
         # Check if trigger device has binding cluster
         # This requires checking the actual Matter node
@@ -818,38 +1430,57 @@ class MatterBindingManager:
         Returns:
             True if the device has the Binding cluster.
         """
-        # Get the Matter node for this entity
-        try:
-            matter = get_matter(self._hass)
-        except (KeyError, StopIteration):
-            LOGGER.debug("Matter integration not available")
+        # Get the specific Matter node for this entity
+        node = self._get_node_for_entity(entity_id)
+        if node is None:
+            LOGGER.debug(
+                "Could not find Matter node for entity %s",
+                entity_id,
+            )
             return False
 
-        # Get device from entity registry
-        if self._entity_registry is None:
-            return False
+        # Check if any endpoint on THIS node has the Binding cluster
+        for endpoint in node.endpoints.values():
+            if endpoint.has_cluster(CLUSTER_ID_BINDING):
+                LOGGER.debug(
+                    "Node %d endpoint %d has Binding cluster",
+                    node.node_id,
+                    endpoint.endpoint_id,
+                )
+                return True
+
+        LOGGER.debug(
+            "Node %d does not have Binding cluster on any endpoint",
+            node.node_id,
+        )
+        return False
+
+    def _get_node_for_entity(self, entity_id: str):
+        """Get the Matter node for an entity.
+
+        Args:
+            entity_id: The entity_id to look up.
+
+        Returns:
+            The MatterNode for the entity, or None if not found.
+        """
+        try:
+            get_matter(self._hass)
+        except (KeyError, StopIteration):
+            return None
+
+        if self._entity_registry is None or self._device_registry is None:
+            return None
 
         entity_entry = self._entity_registry.async_get(entity_id)
         if entity_entry is None or entity_entry.device_id is None:
-            return False
+            return None
 
-        # Get the node from device
         device = self._device_registry.async_get(entity_entry.device_id)
         if device is None:
-            return False
+            return None
 
-        # Check if any endpoint has the Binding cluster
-        for node in matter.matter_client.get_nodes():
-            for endpoint in node.endpoints.values():
-                if endpoint.has_cluster(CLUSTER_ID_BINDING):
-                    LOGGER.debug(
-                        "Node %d endpoint %d has Binding cluster",
-                        node.node_id,
-                        endpoint.endpoint_id,
-                    )
-                    return True
-
-        return False
+        return get_node_from_device_entry(self._hass, device)
 
     async def _check_entity_has_client_cluster(self, entity_id: str) -> bool:
         """Check if an entity's Matter device has a client cluster.
@@ -863,32 +1494,36 @@ class MatterBindingManager:
         Returns:
             True if the device has an appropriate client cluster.
         """
-
-        try:
-            matter = get_matter(self._hass)
-        except (KeyError, StopIteration):
-            LOGGER.debug("Matter integration not available")
+        # Get the specific Matter node for this entity
+        node = self._get_node_for_entity(entity_id)
+        if node is None:
+            LOGGER.debug(
+                "Could not find Matter node for entity %s",
+                entity_id,
+            )
             return False
 
-        # For now, check if any node has client device types
         client_device_types = (
             device_types.OnOffLightSwitch,
             device_types.DimmerSwitch,
             device_types.ColorDimmerSwitch,
         )
 
-        for node in matter.matter_client.get_nodes():
-            for endpoint in node.endpoints.values():
-                for dt in endpoint.device_types:
-                    if dt in client_device_types:
-                        LOGGER.debug(
-                            "Node %d endpoint %d has client device type: %s",
-                            node.node_id,
-                            endpoint.endpoint_id,
-                            dt.__name__,
-                        )
-                        return True
+        for endpoint in node.endpoints.values():
+            for dt in endpoint.device_types:
+                if dt in client_device_types:
+                    LOGGER.debug(
+                        "Node %d endpoint %d has client device type: %s",
+                        node.node_id,
+                        endpoint.endpoint_id,
+                        dt.__name__,
+                    )
+                    return True
 
+        LOGGER.debug(
+            "Node %d does not have client device type on any endpoint",
+            node.node_id,
+        )
         return False
 
     async def _analyze_automation(self, automation_id: str) -> list[str]:
@@ -1191,6 +1826,89 @@ class MatterBindingManager:
 
         LOGGER.info(
             "Client cluster discovery complete: %d switch, %d light entities",
+            len(switch_entities),
+            len(light_entities),
+        )
+
+    async def _async_discover_client_clusters_for_node(self, node) -> None:
+        """Discover client cluster entities for a specific Matter node.
+
+        This is called when a new node is added to discover any client clusters.
+
+        Args:
+            node: The MatterNode to discover entities for.
+        """
+        LOGGER.info("Discovering client cluster entities for node %d", node.node_id)
+
+        # Get the matter adapter
+        try:
+            matter = get_matter(self._hass)
+        except KeyError:
+            LOGGER.warning("Matter integration not available")
+            return
+
+        # Get runtime data for entity callbacks
+        runtime_data = self._config_entry.runtime_data
+
+        # Collect entities to add by platform
+        switch_entities: list = []
+        light_entities: list = []
+
+        LOGGER.debug(
+            "Checking node %d for client clusters (endpoints: %s)",
+            node.node_id,
+            list(node.endpoints.keys()),
+        )
+
+        for endpoint in node.endpoints.values():
+            # Skip root endpoint (0)
+            if endpoint.endpoint_id == 0:
+                continue
+
+            # Discover client cluster entities for this endpoint
+            for entity_info in async_discover_client_cluster_entities(
+                endpoint, self._entity_registry
+            ):
+                LOGGER.info(
+                    "Creating %s entity for node %d endpoint %d",
+                    entity_info.platform,
+                    node.node_id,
+                    endpoint.endpoint_id,
+                )
+
+                # Create the entity
+                entity = entity_info.entity_class(
+                    matter.matter_client,
+                    endpoint,
+                    entity_info,
+                )
+
+                # Add to appropriate list
+                if entity_info.platform.value == "switch":
+                    switch_entities.append(entity)
+                elif entity_info.platform.value == "light":
+                    light_entities.append(entity)
+
+        # Add entities via platform callbacks
+        if switch_entities and runtime_data.switch_add_entities:
+            LOGGER.info(
+                "Adding %d switch entities for node %d",
+                len(switch_entities),
+                node.node_id,
+            )
+            runtime_data.switch_add_entities(switch_entities)
+
+        if light_entities and runtime_data.light_add_entities:
+            LOGGER.info(
+                "Adding %d light entities for node %d",
+                len(light_entities),
+                node.node_id,
+            )
+            runtime_data.light_add_entities(light_entities)
+
+        LOGGER.info(
+            "Client cluster discovery for node %d complete: %d switch, %d light entities",
+            node.node_id,
             len(switch_entities),
             len(light_entities),
         )
