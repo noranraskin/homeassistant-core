@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Generator
 from typing import TYPE_CHECKING
 
+from chip.clusters import Objects as Clusters
 from matter_server.client.models import device_types
 
 from homeassistant.const import Platform
@@ -61,6 +62,45 @@ def _get_discovery_schemas() -> list[ClientClusterDiscoverySchema]:
     ]
 
 
+def endpoint_has_server_and_client_clusters(
+    endpoint: MatterEndpoint,
+    cluster_ids: tuple[int, ...],
+) -> bool:
+    """Check if endpoint has BOTH server and client for given cluster IDs.
+
+    This identifies "stateful switches" - devices that have both server and client
+    clusters for the same functionality (e.g., OnOff server + OnOff client).
+    These devices already get entities from the official Matter integration
+    via their server clusters, so we don't need to create additional entities.
+
+    Args:
+        endpoint: The Matter endpoint to check.
+        cluster_ids: Tuple of cluster IDs to check (e.g., OnOff, LevelControl).
+
+    Returns:
+        True if ANY of the cluster_ids appear in BOTH serverList and clientList.
+    """
+    descriptor = endpoint.get_cluster(Clusters.Descriptor)
+    if descriptor is None:
+        return False
+
+    server_list = set(descriptor.serverList or [])
+    client_list = set(descriptor.clientList or [])
+
+    # Check if any of the required clusters appear in BOTH lists
+    for cluster_id in cluster_ids:
+        if cluster_id in server_list and cluster_id in client_list:
+            LOGGER.debug(
+                "Endpoint %d has cluster 0x%04X in both server and client lists "
+                "(stateful switch)",
+                endpoint.endpoint_id,
+                cluster_id,
+            )
+            return True
+
+    return False
+
+
 def endpoint_has_existing_entity(
     endpoint: MatterEndpoint,
     entity_registry: er.EntityRegistry,
@@ -115,12 +155,26 @@ def async_discover_client_cluster_entities(
     """Discover client cluster entities for a Matter endpoint.
 
     Yields ClientClusterEntityInfo for each matching discovery schema.
-    Skips endpoints that already have suitable entities from the matter integration.
+    Skips endpoints that:
+    - Already have suitable entities from the matter integration
+    - Have both server AND client clusters (stateful switches)
     """
-    # Check if endpoint already has entities
+    # Check if endpoint already has entities from matter integration
     if endpoint_has_existing_entity(endpoint, entity_registry):
         LOGGER.debug(
             "Skipping endpoint %d - already has entities",
+            endpoint.endpoint_id,
+        )
+        return
+
+    # Check if endpoint has BOTH server and client clusters (stateful switch)
+    # These devices already have entities via their server clusters
+    if endpoint_has_server_and_client_clusters(
+        endpoint, (CLUSTER_ID_ON_OFF, CLUSTER_ID_LEVEL_CONTROL)
+    ):
+        LOGGER.debug(
+            "Skipping endpoint %d - has both server and client clusters "
+            "(stateful switch, already has entities via server clusters)",
             endpoint.endpoint_id,
         )
         return

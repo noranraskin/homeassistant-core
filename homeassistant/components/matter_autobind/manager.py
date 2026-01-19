@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from chip.clusters import Objects as Clusters
 from matter_server.client.models import device_types
 from matter_server.common.models import EventType
 
@@ -29,7 +32,12 @@ from homeassistant.helpers.event import (
     async_track_state_change_event,
 )
 
-from .const import CLUSTER_ID_BINDING, DOMAIN as AUTOBIND_DOMAIN, LOGGER
+from .const import (
+    CLUSTER_ID_BINDING,
+    CLUSTER_ID_ON_OFF,
+    DOMAIN as AUTOBIND_DOMAIN,
+    LOGGER,
+)
 from .store import AclEntryDict, BindingEntryDict, EligibilityStatus, MatterBindingStore
 
 if TYPE_CHECKING:
@@ -44,6 +52,28 @@ from .discovery import async_discover_client_cluster_entities
 
 # Matter domain constant
 MATTER_DOMAIN = "matter"
+
+
+@dataclass
+class StatefulSwitchInfo:
+    """Information about a stateful switch entity.
+
+    Stateful switches have both server and client clusters on the same endpoint.
+    They need special handling to track whether state changes are from UI or
+    physical device interactions.
+    """
+
+    entity_id: str
+    """The entity_id of the stateful switch."""
+
+    node_id: int
+    """The Matter node ID."""
+
+    endpoint_id: int
+    """The endpoint ID with both server and client clusters."""
+
+    client_clusters: list[int]
+    """List of client cluster IDs available for binding."""
 
 
 class MatterBindingManager:
@@ -78,11 +108,210 @@ class MatterBindingManager:
         self._entity_registry: er.EntityRegistry | None = None
         self._device_registry: dr.DeviceRegistry | None = None
         self._unsub_automation_listeners: list[CALLBACK_TYPE] = []
+        # Track stateful switches (entities with both server + client clusters)
+        # Key: entity_id, Value: StatefulSwitchInfo
+        self._stateful_switches: dict[str, StatefulSwitchInfo] = {}
+        # Track trigger entities for automation suppression
+        # Key: trigger entity_id, Value: automation_id
+        self._trigger_to_automation: dict[str, str] = {}
+        # Track unsubscribe callbacks for trigger entity state changes
+        # Key: trigger entity_id, Value: unsubscribe callback
+        self._unsub_trigger_listeners: dict[str, CALLBACK_TYPE] = {}
 
     @property
     def store(self) -> MatterBindingStore:
         """Return the store instance."""
         return self._store
+
+    @callback
+    def is_physical_state_change(self, event: Event[EventStateChangedData]) -> bool:
+        """Determine if a state change originated from a physical device interaction.
+
+        This is used to differentiate between:
+        - UI/service call initiated changes -> automation should run normally
+        - Physical device button presses -> automation should be suppressed
+          (the binding handles the direct control)
+
+        Args:
+            event: The state changed event to analyze.
+
+        Returns:
+            True if the change was from physical device interaction (suppress automation).
+            False if the change was from UI/HA service call (run automation normally).
+        """
+        entity_id = event.data["entity_id"]
+        context = event.context
+
+        # If user_id is set, this was from the UI or a user-initiated service call
+        if context.user_id is not None:
+            LOGGER.debug(
+                "State change for %s originated from UI (user_id: %s)",
+                entity_id,
+                context.user_id,
+            )
+            return False
+
+        # If parent_id is set but no user_id, it's from an automation/script
+        # which means it could be from our own automation triggering
+        if context.parent_id is not None:
+            LOGGER.debug(
+                "State change for %s originated from automation/script (parent_id: %s)",
+                entity_id,
+                context.parent_id,
+            )
+            return False
+
+        # If neither user_id nor parent_id is set, this is likely from:
+        # - Device state update (physical button press)
+        # - Integration pushing state (e.g., Matter server reporting device change)
+        LOGGER.debug(
+            "State change for %s originated from device (no context parent/user) - "
+            "this is a physical interaction, automation will be suppressed",
+            entity_id,
+        )
+        return True
+
+    @callback
+    def _subscribe_to_trigger_entity(
+        self, trigger_entity_id: str, automation_id: str
+    ) -> None:
+        """Subscribe to state changes on a trigger entity for automation suppression.
+
+        When a physical state change is detected (no user_id in context),
+        the associated automation will be temporarily disabled to prevent
+        duplicate execution (since the binding handles the action directly).
+
+        Args:
+            trigger_entity_id: The entity_id of the trigger device.
+            automation_id: The automation entity_id to suppress.
+        """
+        # Skip if already subscribed
+        if trigger_entity_id in self._unsub_trigger_listeners:
+            LOGGER.debug(
+                "Already subscribed to %s for automation suppression",
+                trigger_entity_id,
+            )
+            return
+
+        # Store the mapping
+        self._trigger_to_automation[trigger_entity_id] = automation_id
+
+        # Subscribe to state changes
+        unsub = async_track_state_change_event(
+            self._hass,
+            [trigger_entity_id],
+            self._handle_trigger_state_change,
+        )
+        self._unsub_trigger_listeners[trigger_entity_id] = unsub
+
+        LOGGER.info(
+            "Subscribed to %s for physical interaction detection (automation: %s)",
+            trigger_entity_id,
+            automation_id,
+        )
+
+    @callback
+    def _unsubscribe_from_trigger_entity(self, trigger_entity_id: str) -> None:
+        """Unsubscribe from state changes on a trigger entity.
+
+        Args:
+            trigger_entity_id: The entity_id to unsubscribe from.
+        """
+        if trigger_entity_id in self._unsub_trigger_listeners:
+            self._unsub_trigger_listeners[trigger_entity_id]()
+            del self._unsub_trigger_listeners[trigger_entity_id]
+            LOGGER.debug("Unsubscribed from %s", trigger_entity_id)
+
+        if trigger_entity_id in self._trigger_to_automation:
+            del self._trigger_to_automation[trigger_entity_id]
+
+    @callback
+    def _handle_trigger_state_change(self, event: Event[EventStateChangedData]) -> None:
+        """Handle state change on a bound trigger entity.
+
+        If the state change is from a physical interaction (no user_id),
+        temporarily disable the associated automation to prevent it from
+        running (the binding already handles the action).
+
+        Args:
+            event: The state changed event.
+        """
+        entity_id = event.data["entity_id"]
+        old_state = event.data["old_state"]
+        new_state = event.data["new_state"]
+
+        # Skip if states are the same (attribute-only change)
+        if old_state is not None and new_state is not None:
+            if old_state.state == new_state.state:
+                return
+
+        # Check if this is a physical state change
+        if not self.is_physical_state_change(event):
+            LOGGER.debug(
+                "State change on %s was from UI/automation - letting automation run",
+                entity_id,
+            )
+            return
+
+        # Get the associated automation
+        automation_id = self._trigger_to_automation.get(entity_id)
+        if automation_id is None:
+            LOGGER.debug(
+                "No automation associated with trigger %s, skipping suppression",
+                entity_id,
+            )
+            return
+
+        # Temporarily disable the automation to prevent it from running
+        LOGGER.info(
+            "Physical interaction detected on %s - temporarily disabling automation %s",
+            entity_id,
+            automation_id,
+        )
+        self._hass.async_create_task(self._async_suppress_automation(automation_id))
+
+    async def _async_suppress_automation(self, automation_id: str) -> None:
+        """Temporarily disable an automation to prevent it from running.
+
+        The automation is disabled, waits briefly, then re-enabled.
+        This prevents the automation from triggering when a physical
+        button press occurs (since the binding handles the action).
+
+        Args:
+            automation_id: The automation entity_id to suppress.
+        """
+        try:
+            # Disable the automation
+            await self._hass.services.async_call(
+                "automation",
+                "turn_off",
+                {"entity_id": automation_id},
+                blocking=True,
+            )
+            LOGGER.debug("Disabled automation %s", automation_id)
+
+            # Wait briefly to ensure automation doesn't trigger
+            # This is a short window since the state change event propagates quickly
+            await asyncio.sleep(0.5)
+
+            # Re-enable the automation
+            await self._hass.services.async_call(
+                "automation",
+                "turn_on",
+                {"entity_id": automation_id},
+                blocking=True,
+            )
+            LOGGER.info(
+                "Re-enabled automation %s after physical interaction suppression",
+                automation_id,
+            )
+
+        except Exception as err:  # noqa: BLE001
+            LOGGER.error(
+                "Failed to suppress automation %s: %s",
+                automation_id,
+                err,
+            )
 
     async def async_setup(self) -> None:
         """Set up the manager.
@@ -124,6 +353,12 @@ class MatterBindingManager:
         for unsub in self._unsub_automation_listeners:
             unsub()
         self._unsub_automation_listeners.clear()
+
+        # Unsubscribe from trigger entity state changes
+        for unsub in self._unsub_trigger_listeners.values():
+            unsub()
+        self._unsub_trigger_listeners.clear()
+        self._trigger_to_automation.clear()
 
         # Save any pending state
         await self._store.async_save()
@@ -342,6 +577,11 @@ class MatterBindingManager:
         # Also clear scanned status and eligibility result
         await self._store.async_clear_scanned_automation(automation_id)
 
+        # Unsubscribe from trigger entities for this automation
+        for trigger_entity_id, auto_id in list(self._trigger_to_automation.items()):
+            if auto_id == automation_id:
+                self._unsubscribe_from_trigger_entity(trigger_entity_id)
+
     async def _async_handle_automation_disabled(self, automation_id: str) -> None:
         """Handle an automation being disabled.
 
@@ -464,6 +704,12 @@ class MatterBindingManager:
             await self._async_create_bindings_for_automation(
                 automation_id, trigger_entities, action_entities
             )
+
+            # Subscribe to trigger entity state changes for automation suppression
+            # This allows us to detect physical button presses and prevent
+            # the automation from running (the binding handles the action directly)
+            for trigger_entity_id in trigger_entities:
+                self._subscribe_to_trigger_entity(trigger_entity_id, automation_id)
         else:
             LOGGER.info(
                 "✗ INELIGIBLE: Automation %s (%s) is not eligible for Matter binding",
@@ -1485,8 +1731,10 @@ class MatterBindingManager:
     async def _check_entity_has_client_cluster(self, entity_id: str) -> bool:
         """Check if an entity's Matter device has a client cluster.
 
-        Client clusters are identified by checking device types like
-        OnOffLightSwitch, DimmerSwitch, etc.
+        Client clusters are identified by:
+        1. Checking device types like OnOffLightSwitch, DimmerSwitch, etc.
+        2. For stateful switches (server entities), checking the Descriptor cluster's
+           clientList for matching clusters (e.g., OnOff in both server and client)
 
         Args:
             entity_id: The entity_id to check.
@@ -1510,6 +1758,7 @@ class MatterBindingManager:
         )
 
         for endpoint in node.endpoints.values():
+            # Check 1: Traditional client device types
             for dt in endpoint.device_types:
                 if dt in client_device_types:
                     LOGGER.debug(
@@ -1520,8 +1769,26 @@ class MatterBindingManager:
                     )
                     return True
 
+            # Check 2: Stateful switches - have BOTH server and client clusters
+            # These are devices like DimmableLightSwitch that have OnOff server
+            # (for local state) AND OnOff client (for controlling other devices)
+            descriptor = endpoint.get_cluster(Clusters.Descriptor)
+            if descriptor is not None:
+                client_list = set(descriptor.clientList or [])
+                # Check if endpoint has OnOff or LevelControl in client list
+                if CLUSTER_ID_ON_OFF in client_list:
+                    # Also verify it has the binding cluster for actual binding capability
+                    if endpoint.has_cluster(CLUSTER_ID_BINDING):
+                        LOGGER.debug(
+                            "Node %d endpoint %d is a stateful switch "
+                            "(has OnOff client cluster + binding cluster)",
+                            node.node_id,
+                            endpoint.endpoint_id,
+                        )
+                        return True
+
         LOGGER.debug(
-            "Node %d does not have client device type on any endpoint",
+            "Node %d does not have client cluster capability on any endpoint",
             node.node_id,
         )
         return False

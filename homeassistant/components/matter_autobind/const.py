@@ -21,6 +21,8 @@ CLUSTER_ID_BINDING: Final = 0x001E  # Binding Cluster (Client devices)
 CLUSTER_ID_ON_OFF: Final = 0x0006  # On/Off Cluster
 CLUSTER_ID_LEVEL_CONTROL: Final = 0x0008  # Level Control Cluster
 CLUSTER_ID_COLOR_CONTROL: Final = 0x0300  # Color Control Cluster
+CLUSTER_ID_DESCRIPTOR: Final = 0x001D  # Descriptor Cluster
+CLUSTER_ID_GROUPS: Final = 0x0004  # Groups Cluster
 
 # Service to Cluster mapping
 # Maps Home Assistant services to Matter Cluster IDs
