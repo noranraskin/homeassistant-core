@@ -117,6 +117,9 @@ class MatterBindingManager:
         # Track unsubscribe callbacks for trigger entity state changes
         # Key: trigger entity_id, Value: unsubscribe callback
         self._unsub_trigger_listeners: dict[str, CALLBACK_TYPE] = {}
+        # Track automations currently being suppressed (temporary disable)
+        # Used to prevent binding removal when we temporarily disable automation
+        self._suppressing_automations: set[str] = set()
 
     @property
     def store(self) -> MatterBindingStore:
@@ -281,6 +284,10 @@ class MatterBindingManager:
             automation_id: The automation entity_id to suppress.
         """
         try:
+            # Mark automation as being suppressed BEFORE disabling
+            # This prevents _handle_automation_updated from removing bindings
+            self._suppressing_automations.add(automation_id)
+
             # Disable the automation
             await self._hass.services.async_call(
                 "automation",
@@ -312,6 +319,9 @@ class MatterBindingManager:
                 automation_id,
                 err,
             )
+        finally:
+            # Always remove from suppression set when done
+            self._suppressing_automations.discard(automation_id)
 
     async def async_setup(self) -> None:
         """Set up the manager.
@@ -497,6 +507,14 @@ class MatterBindingManager:
             and old_state.state == "on"
             and new_state.state == "off"
         ):
+            # Check if this is our own temporary suppression - skip binding removal
+            if entity_id in self._suppressing_automations:
+                LOGGER.debug(
+                    "Automation %s is being suppressed by us, skipping binding removal",
+                    entity_id,
+                )
+                return
+
             LOGGER.info(
                 "Automation %s was disabled, removing bindings (keeping ACLs)",
                 entity_id,
@@ -512,6 +530,14 @@ class MatterBindingManager:
             and old_state.state == "off"
             and new_state.state == "on"
         ):
+            # Check if this is our own re-enabling after suppression - skip binding recreation
+            if entity_id in self._suppressing_automations:
+                LOGGER.debug(
+                    "Automation %s is being re-enabled after suppression, skipping binding recreation",
+                    entity_id,
+                )
+                return
+
             LOGGER.info("Automation %s was enabled, recreating bindings", entity_id)
             self._hass.async_create_task(
                 self._async_handle_automation_enabled(entity_id)
