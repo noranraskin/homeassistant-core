@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+import secrets
+import time
+from typing import TYPE_CHECKING, Any
 
 from chip.clusters import Objects as Clusters
 from matter_server.client.models import device_types
@@ -35,10 +37,19 @@ from homeassistant.helpers.event import (
 from .const import (
     CLUSTER_ID_BINDING,
     CLUSTER_ID_ON_OFF,
+    DEBUG_OVERWRITE_ACLS,
     DOMAIN as AUTOBIND_DOMAIN,
     LOGGER,
 )
-from .store import AclEntryDict, BindingEntryDict, EligibilityStatus, MatterBindingStore
+from .store import (
+    AclEntryDict,
+    BindingEntryDict,
+    EligibilityStatus,
+    MatterBindingStore,
+    acl_key,
+    binding_key,
+    group_key,
+)
 
 if TYPE_CHECKING:
     from homeassistant.config_entries import ConfigEntry
@@ -74,6 +85,42 @@ class StatefulSwitchInfo:
 
     client_clusters: list[int]
     """List of client cluster IDs available for binding."""
+
+
+@dataclass
+class NodeInfo:
+    """Information about a Matter node derived from an entity."""
+
+    entity_id: str
+    """The entity_id."""
+
+    node_id: int
+    """The Matter node ID."""
+
+    endpoint_id: int
+    """The endpoint ID (typically 1 for most devices)."""
+
+
+@dataclass
+class DesiredResourceState:
+    """Represents the desired resource state for an automation.
+
+    This is computed from the automation's trigger and action entities,
+    then compared against the current state to determine what operations
+    are needed to reconcile.
+    """
+
+    # Set of (target_node_id, source_node_id, endpoint_id) tuples
+    acls: set[tuple[int, int, int]]
+
+    # Set of (source_node, source_ep, target (int or "gXXXX"), target_ep) tuples
+    bindings: set[tuple[int, int, int | str, int]]
+
+    # Set of (group_id, frozenset of (node_id, endpoint_id)) tuples
+    groups: set[tuple[int, frozenset[tuple[int, int]]]]
+
+    # The group ID to use if needed (None if single target)
+    group_id: int | None = None
 
 
 class MatterBindingManager:
@@ -565,40 +612,17 @@ class MatterBindingManager:
     async def _async_handle_automation_deleted(self, automation_id: str) -> None:
         """Handle an automation being deleted.
 
-        Cleans up both ACL entries and bindings created for this automation.
+        Uses reference-counted resource release which only removes ACLs,
+        bindings, and groups from devices when no other automation still
+        needs them.
 
         Args:
             automation_id: The entity_id of the deleted automation.
         """
-        LOGGER.info(
-            "Cleaning up ACLs and bindings for deleted automation: %s", automation_id
-        )
+        LOGGER.info("Cleaning up resources for deleted automation: %s", automation_id)
 
-        # Get and remove ACL entries from store
-        acl_entries = await self._store.async_remove_acls_for_automation(automation_id)
-
-        # Remove ACL entries from devices
-        if acl_entries:
-            await self._async_remove_acl_entries_from_devices(
-                automation_id, acl_entries
-            )
-            LOGGER.info(
-                "Cleaned up %d ACL entries for automation %s",
-                len(acl_entries),
-                automation_id,
-            )
-
-        # Get and remove bindings from store
-        bindings = await self._store.async_remove_bindings_for_automation(automation_id)
-
-        # Remove bindings from devices
-        if bindings:
-            await self._async_remove_bindings_from_devices(automation_id, bindings)
-            LOGGER.info(
-                "Cleaned up %d bindings for automation %s",
-                len(bindings),
-                automation_id,
-            )
+        # Release all resources with reference counting
+        await self._release_all_resources(automation_id)
 
         # Also clear scanned status and eligibility result
         await self._store.async_clear_scanned_automation(automation_id)
@@ -611,49 +635,39 @@ class MatterBindingManager:
     async def _async_handle_automation_disabled(self, automation_id: str) -> None:
         """Handle an automation being disabled.
 
-        Removes bindings but keeps ACLs for potential re-enabling.
+        Releases all resources since the automation shouldn't affect
+        devices while disabled.
 
         Args:
             automation_id: The entity_id of the disabled automation.
         """
-        LOGGER.info("Removing bindings for disabled automation: %s", automation_id)
+        LOGGER.info("Releasing resources for disabled automation: %s", automation_id)
 
-        # Get and remove bindings from store
-        bindings = await self._store.async_remove_bindings_for_automation(automation_id)
-
-        # Remove bindings from devices
-        if bindings:
-            await self._async_remove_bindings_from_devices(automation_id, bindings)
-            LOGGER.info(
-                "Removed %d bindings for disabled automation %s",
-                len(bindings),
-                automation_id,
-            )
-        else:
-            LOGGER.debug("No bindings to remove for automation %s", automation_id)
+        # Release all resources
+        await self._release_all_resources(automation_id)
 
     async def _async_handle_automation_enabled(self, automation_id: str) -> None:
         """Handle an automation being re-enabled.
 
-        Recreates bindings. ACLs should still exist from initial setup.
+        Recreates all resources using reconciliation.
 
         Args:
             automation_id: The entity_id of the enabled automation.
         """
-        LOGGER.info("Recreating bindings for enabled automation: %s", automation_id)
+        LOGGER.info("Recreating resources for enabled automation: %s", automation_id)
 
         # Get eligibility result to find trigger/action entities
         result = self._store.get_eligibility_result(automation_id)
         if result is None:
             LOGGER.warning(
-                "No eligibility result found for automation %s, cannot recreate bindings",
+                "No eligibility result found for automation %s, cannot recreate resources",
                 automation_id,
             )
             return
 
         if result["status"] != EligibilityStatus.ELIGIBLE:
             LOGGER.debug(
-                "Automation %s is not eligible, skipping binding recreation",
+                "Automation %s is not eligible, skipping resource recreation",
                 automation_id,
             )
             return
@@ -661,34 +675,24 @@ class MatterBindingManager:
         trigger_entities = result["trigger_entities"]
         action_entities = result["action_entities"]
 
-        # Recreate bindings
-        await self._async_create_bindings_for_automation(
+        # Use reconciliation to recreate all resources
+        await self._reconcile_automation_resources(
             automation_id, trigger_entities, action_entities
         )
 
     async def _async_check_and_log_automation(
         self, automation_id: str, is_new: bool
     ) -> None:
-        """Check automation eligibility and log the result.
+        """Check automation eligibility and set up resources using reconciliation.
+
+        Uses the declarative reconciliation approach that handles both new and
+        updated automations uniformly by computing desired vs current state.
 
         Args:
             automation_id: The entity_id of the automation to check.
             is_new: True if this is a newly created automation.
         """
         action = "created" if is_new else "updated"
-
-        # If this is an update, clear the previous scanned status and ACLs so we recheck
-        if not is_new:
-            # Mark as not scanned so we re-evaluate
-            await self._store.async_clear_scanned_automation(automation_id)
-            LOGGER.debug("Cleared previous scan status for %s", automation_id)
-
-            # Remove any existing ACLs for this automation
-            old_acls = await self._store.async_remove_acls_for_automation(automation_id)
-            if old_acls:
-                await self._async_remove_acl_entries_from_devices(
-                    automation_id, old_acls
-                )
 
         # Check eligibility
         (
@@ -711,7 +715,6 @@ class MatterBindingManager:
         # Mark as scanned
         await self._store.async_mark_automation_scanned(automation_id)
 
-        # Log the result and create ACLs if eligible
         if is_eligible:
             LOGGER.info(
                 "✓ ELIGIBLE: Automation %s (%s) is eligible for Matter binding",
@@ -721,22 +724,20 @@ class MatterBindingManager:
             LOGGER.info("  Trigger entities: %s", trigger_entities)
             LOGGER.info("  Action entities: %s", action_entities)
 
-            # Create ACL entries for this automation
-            await self._async_create_acl_for_automation(
-                automation_id, trigger_entities, action_entities
-            )
-
-            # Create bindings on trigger devices to target devices
-            await self._async_create_bindings_for_automation(
+            # Use reconciliation to set up resources
+            # This handles both new automations and updates uniformly
+            await self._reconcile_automation_resources(
                 automation_id, trigger_entities, action_entities
             )
 
             # Subscribe to trigger entity state changes for automation suppression
-            # This allows us to detect physical button presses and prevent
-            # the automation from running (the binding handles the action directly)
             for trigger_entity_id in trigger_entities:
                 self._subscribe_to_trigger_entity(trigger_entity_id, automation_id)
         else:
+            # If previously eligible, release resources
+            if not is_new:
+                await self._release_all_resources(automation_id)
+
             LOGGER.info(
                 "✗ INELIGIBLE: Automation %s (%s) is not eligible for Matter binding",
                 automation_id,
@@ -2205,3 +2206,1704 @@ class MatterBindingManager:
             len(switch_entities),
             len(light_entities),
         )
+
+    # =========================================================================
+    # State Reconciliation Methods (New Reference-Counted Approach)
+    # =========================================================================
+
+    async def _get_node_info_for_entities(
+        self, entity_ids: list[str]
+    ) -> list[NodeInfo]:
+        """Get NodeInfo for a list of entity IDs.
+
+        Args:
+            entity_ids: List of entity IDs.
+
+        Returns:
+            List of NodeInfo objects with node and endpoint information.
+        """
+        result: list[NodeInfo] = []
+
+        try:
+            get_matter(self._hass)
+        except (KeyError, StopIteration):
+            return result
+
+        if self._entity_registry is None:
+            return result
+
+        for entity_id in entity_ids:
+            entity_entry = self._entity_registry.async_get(entity_id)
+            if entity_entry is None or entity_entry.device_id is None:
+                continue
+
+            if self._device_registry is None:
+                continue
+
+            device = self._device_registry.async_get(entity_entry.device_id)
+            if device is None:
+                continue
+
+            # Find Matter node ID from device identifiers
+            node_id: int | None = None
+            for domain, identifier in device.identifiers:
+                if domain == MATTER_DOMAIN:
+                    # Try to parse as simple integer first
+                    with contextlib.suppress(ValueError):
+                        node_id = int(identifier)
+
+                    # Try to parse "deviceid_FABRIC-NODEID-MatterNodeDevice" format
+                    if node_id is None and identifier.startswith("deviceid_"):
+                        try:
+                            parts = identifier.split("-")
+                            if len(parts) >= 2:
+                                node_id = int(parts[1], 16)
+                        except (ValueError, IndexError):
+                            pass
+
+                    if node_id is not None:
+                        break
+
+            if node_id is not None:
+                # Default to endpoint 1 for most devices
+                result.append(
+                    NodeInfo(
+                        entity_id=entity_id,
+                        node_id=node_id,
+                        endpoint_id=1,
+                    )
+                )
+
+        return result
+
+    def _compute_desired_state(
+        self,
+        trigger_nodes: list[NodeInfo],
+        action_nodes: list[NodeInfo],
+        existing_group_id: int | None = None,
+    ) -> DesiredResourceState:
+        """Compute what resources SHOULD exist for this automation.
+
+        Args:
+            trigger_nodes: List of trigger node info.
+            action_nodes: List of action node info.
+            existing_group_id: Reuse existing group ID if available.
+
+        Returns:
+            DesiredResourceState with all required resources.
+        """
+        acls: set[tuple[int, int, int]] = set()
+        bindings: set[tuple[int, int, int | str, int]] = set()
+        groups: set[tuple[int, frozenset[tuple[int, int]]]] = set()
+        group_id: int | None = None
+
+        # Bindings: Depends on target count
+        if len(action_nodes) == 1:
+            # Single target: unicast bindings
+            # ACLs use source_node_id as subject with authMode=2 (CASE)
+            target = action_nodes[0]
+            for source in trigger_nodes:
+                # ACL tuple: (target_node_id, subject, auth_mode)
+                # authMode 2 = CASE (node-to-node)
+                acls.add((target.node_id, source.node_id, 2))
+                bindings.add(
+                    (
+                        source.node_id,
+                        source.endpoint_id,
+                        target.node_id,  # Direct node reference (int)
+                        target.endpoint_id,
+                    )
+                )
+        elif len(action_nodes) > 1:
+            # Multiple targets: group binding
+            group_id = existing_group_id or self._store.allocate_group_id()
+
+            # Group membership
+            members = frozenset((n.node_id, n.endpoint_id) for n in action_nodes)
+            groups.add((group_id, members))
+
+            # ACLs: Each target needs BOTH:
+            # 1. GROUP ACL (authMode=3) for receiving group multicast messages
+            # 2. CASE ACLs (authMode=2) for each source (for unicast fallback/setup)
+            for target in action_nodes:
+                # GROUP ACL for group messages
+                acls.add((target.node_id, group_id, 3))
+                # CASE ACLs for each source node
+                for source in trigger_nodes:
+                    acls.add((target.node_id, source.node_id, 2))
+
+            # Group bindings for each trigger (source -> group)
+            for source in trigger_nodes:
+                bindings.add(
+                    (
+                        source.node_id,
+                        source.endpoint_id,
+                        f"g{group_id}",  # Group reference (string)
+                        0,  # Endpoint not used for group bindings
+                    )
+                )
+
+        return DesiredResourceState(
+            acls=acls,
+            bindings=bindings,
+            groups=groups,
+            group_id=group_id,
+        )
+
+    def _get_current_resource_state(self, automation_id: str) -> DesiredResourceState:
+        """Get current resource state for an automation from the store.
+
+        Args:
+            automation_id: The automation to get state for.
+
+        Returns:
+            DesiredResourceState representing current resources.
+        """
+        acls: set[tuple[int, int, int]] = set()
+        bindings: set[tuple[int, int, int | str, int]] = set()
+        groups: set[tuple[int, frozenset[tuple[int, int]]]] = set()
+
+        resources = self._store.get_automation_resources(automation_id)
+        if resources is None:
+            return DesiredResourceState(acls=acls, bindings=bindings, groups=groups)
+
+        # Extract ACLs
+        for key in resources["acl_keys"]:
+            acl = self._store.get_acl_resource(key)
+            if acl:
+                acls.add(
+                    (
+                        acl["target_node_id"],
+                        acl["source_node_id"],
+                        acl["endpoint_id"],
+                    )
+                )
+
+        # Extract bindings
+        for key in resources["binding_keys"]:
+            binding = self._store.get_binding_resource(key)
+            if binding:
+                target: int | str
+                if binding["target_group_id"] is not None:
+                    target = f"g{binding['target_group_id']}"
+                else:
+                    target = binding["target_node_id"] or 0
+                bindings.add(
+                    (
+                        binding["source_node_id"],
+                        binding["source_endpoint"],
+                        target,
+                        binding["target_endpoint"],
+                    )
+                )
+
+        # Extract groups
+        for key in resources["group_keys"]:
+            group = self._store.get_group_resource(key)
+            if group:
+                members = frozenset(
+                    (m["node_id"], m["endpoint_id"]) for m in group["members"]
+                )
+                groups.add((group["group_id"], members))
+
+        return DesiredResourceState(acls=acls, bindings=bindings, groups=groups)
+
+    async def _reconcile_automation_resources(
+        self,
+        automation_id: str,
+        trigger_entities: list[str],
+        action_entities: list[str],
+    ) -> None:
+        """Reconcile current resources to match desired state.
+
+        This is the main entry point for setting up or updating automation resources.
+        It computes the diff between current and desired state, then applies
+        the minimal operations needed.
+
+        Args:
+            automation_id: The automation to reconcile.
+            trigger_entities: List of trigger entity IDs.
+            action_entities: List of action entity IDs.
+        """
+        LOGGER.info("Reconciling resources for automation %s", automation_id)
+
+        # Get node info for entities
+        trigger_nodes = await self._get_node_info_for_entities(trigger_entities)
+        action_nodes = await self._get_node_info_for_entities(action_entities)
+
+        if not trigger_nodes or not action_nodes:
+            LOGGER.warning(
+                "Could not get node info for automation %s entities",
+                automation_id,
+            )
+            return
+
+        # Get current state
+        current = self._get_current_resource_state(automation_id)
+
+        # Compute desired state
+        existing_group_id = self._store.get_existing_group_id(automation_id)
+        desired = self._compute_desired_state(
+            trigger_nodes, action_nodes, existing_group_id
+        )
+
+        LOGGER.debug(
+            "Reconciliation for %s: current=%s, desired=%s",
+            automation_id,
+            current,
+            desired,
+        )
+
+        # --- Reconcile Groups First (create before bindings need them) ---
+        # Pass source nodes so they get the group key for encryption
+        await self._reconcile_groups(
+            automation_id, current.groups, desired.groups, trigger_nodes
+        )
+
+        # --- Reconcile ACLs ---
+        await self._reconcile_acls(automation_id, current.acls, desired.acls)
+
+        # --- Reconcile Bindings ---
+        await self._reconcile_bindings(
+            automation_id, current.bindings, desired.bindings
+        )
+
+        await self._store.async_save()
+        LOGGER.info("Reconciliation complete for automation %s", automation_id)
+
+    async def _reconcile_acls(
+        self,
+        automation_id: str,
+        current: set[tuple[int, int, int]],
+        desired: set[tuple[int, int, int]],
+    ) -> None:
+        """Reconcile ACL resources.
+
+        ACL tuple format: (target_node_id, subject, auth_mode)
+        - For CASE auth (mode=2): subject is source_node_id
+        - For GROUP auth (mode=3): subject is group_id
+        """
+        to_add = desired - current
+        to_remove = current - desired
+
+        for target_node, subject, auth_mode in to_add:
+            key, is_new = self._store.acquire_acl(
+                automation_id, target_node, subject, auth_mode
+            )
+            if is_new:
+                # Actually write ACL to device with correct auth_mode
+                await self._write_acl_to_device(target_node, subject, auth_mode)
+            LOGGER.debug(
+                "Acquired ACL %s (new=%s, auth_mode=%d)", key, is_new, auth_mode
+            )
+
+        for target_node, subject, auth_mode in to_remove:
+            key = acl_key(target_node, subject, auth_mode)
+            should_remove = self._store.release_acl(automation_id, key)
+            if should_remove:
+                # Actually remove ACL from device
+                await self._remove_acl_from_device(target_node, subject, auth_mode)
+            LOGGER.debug("Released ACL %s (removed=%s)", key, should_remove)
+
+    async def _reconcile_bindings(
+        self,
+        automation_id: str,
+        current: set[tuple[int, int, int | str, int]],
+        desired: set[tuple[int, int, int | str, int]],
+    ) -> None:
+        """Reconcile binding resources.
+
+        ALWAYS writes bindings to device regardless of store state to fix
+        store/device sync issues from previous failed writes.
+        """
+        to_add = desired - current
+        to_remove = current - desired
+
+        for source_node, source_ep, target, target_ep in to_add:
+            key, is_new = self._store.acquire_binding(
+                automation_id, source_node, source_ep, target, target_ep
+            )
+            # ALWAYS write to device and verify - don't trust is_new flag
+            # The store may think it exists but the device may not have it
+            LOGGER.info(
+                "Ensuring binding on device: node %d ep %d -> %s (store new=%s)",
+                source_node,
+                source_ep,
+                target,
+                is_new,
+            )
+            await self._write_binding_to_device(
+                source_node, source_ep, target, target_ep
+            )
+            LOGGER.debug("Acquired binding %s (new=%s)", key, is_new)
+
+        for source_node, source_ep, target, target_ep in to_remove:
+            key = binding_key(source_node, source_ep, target, target_ep)
+            should_remove = self._store.release_binding(automation_id, key)
+            if should_remove:
+                # Actually remove binding from device
+                await self._remove_binding_from_device(
+                    source_node, source_ep, target, target_ep
+                )
+            LOGGER.debug("Released binding %s (removed=%s)", key, should_remove)
+
+    async def _reconcile_groups(
+        self,
+        automation_id: str,
+        current: set[tuple[int, frozenset[tuple[int, int]]]],
+        desired: set[tuple[int, frozenset[tuple[int, int]]]],
+        source_nodes: list[NodeInfo] | None = None,
+    ) -> None:
+        """Reconcile group resources.
+
+        Handles:
+        - Creating new groups with sources and targets
+        - Adding/removing targets from existing groups
+        - Adding GroupKeyMap to new sources
+        - Removing GroupKeyMap from old sources
+        - Removing groups when targets drop below 2
+
+        Args:
+            automation_id: The automation ID.
+            current: Current group state (group_id, members frozenset).
+            desired: Desired group state (group_id, members frozenset).
+            source_nodes: Source nodes that need the group key for encryption.
+        """
+        current_by_id = dict(current)
+        desired_by_id = dict(desired)
+        desired_source_ids = (
+            {n.node_id for n in source_nodes} if source_nodes else set()
+        )
+
+        # Groups to add (new group IDs)
+        for gid in desired_by_id.keys() - current_by_id.keys():
+            members = desired_by_id[gid]
+
+            # Only create group if there are 2+ targets
+            if len(members) < 2:
+                LOGGER.debug(
+                    "Skipping group %d creation: only %d target(s), need 2+",
+                    gid,
+                    len(members),
+                )
+                continue
+
+            key, is_new = self._store.acquire_group(
+                automation_id,
+                gid,
+                f"AutoBind-{automation_id[:16]}",
+                list(members),
+            )
+            if is_new:
+                # Actually create group on devices - pass source nodes for key distribution
+                await self._create_group_on_devices(gid, members, source_nodes)
+            LOGGER.debug("Acquired group %s (new=%s)", key, is_new)
+
+        # Groups to update (same ID, different members or sources)
+        for gid in current_by_id.keys() & desired_by_id.keys():
+            current_members = current_by_id[gid]
+            desired_members = desired_by_id[gid]
+            key = group_key(gid)
+
+            # Check if group should be removed (less than 2 targets remaining)
+            if len(desired_members) < 2:
+                LOGGER.info(
+                    "Group %d reduced to %d target(s), removing group",
+                    gid,
+                    len(desired_members),
+                )
+                should_remove = self._store.release_group(automation_id, key)
+                if should_remove:
+                    # Remove from all devices (targets AND sources)
+                    await self._remove_group_completely(gid, current_members)
+                continue
+
+            # Handle member changes
+            if current_members != desired_members:
+                members_to_add = desired_members - current_members
+                members_to_remove = current_members - desired_members
+
+                # For new target members, set up GroupKeyMap first
+                if members_to_add:
+                    await self._setup_group_key_for_new_members(
+                        gid, members_to_add, source_nodes
+                    )
+
+                # Update target group membership
+                for node_id, endpoint_id in members_to_add:
+                    await self._add_device_to_group(gid, node_id, endpoint_id)
+                for node_id, endpoint_id in members_to_remove:
+                    await self._remove_device_from_group(gid, node_id, endpoint_id)
+
+                # Update store with new members
+                self._store.update_group_members(key, list(desired_members))
+
+            # Handle source node changes
+            group_resource = self._store.get_group_resource(key)
+            if group_resource:
+                current_source_ids = set(group_resource.get("source_nodes", []))
+                sources_to_add = desired_source_ids - current_source_ids
+                sources_to_remove = current_source_ids - desired_source_ids
+
+                # Add GroupKeyMap to new sources
+                if sources_to_add:
+                    await self._setup_group_key_for_sources(gid, sources_to_add)
+
+                # Remove GroupKeyMap from old sources
+                if sources_to_remove:
+                    await self._remove_group_key_from_sources(gid, sources_to_remove)
+
+                # Update store with new source list
+                if sources_to_add or sources_to_remove:
+                    self._store.update_group_source_nodes(key, list(desired_source_ids))
+
+        # Groups to remove (no longer needed)
+        for gid in current_by_id.keys() - desired_by_id.keys():
+            key = group_key(gid)
+            should_remove = self._store.release_group(automation_id, key)
+            if should_remove:
+                # Remove from all devices (targets AND sources)
+                members = current_by_id[gid]
+                await self._remove_group_completely(gid, members)
+            LOGGER.debug("Released group %s (removed=%s)", key, should_remove)
+
+    async def _release_all_resources(self, automation_id: str) -> None:
+        """Release all resources for an automation.
+
+        Args:
+            automation_id: The automation to clean up.
+        """
+        LOGGER.info("Releasing all resources for automation %s", automation_id)
+
+        resources = self._store.get_automation_resources(automation_id)
+        if resources is None:
+            return
+
+        # Release bindings first (they may reference groups)
+        for key in list(resources["binding_keys"]):
+            binding = self._store.get_binding_resource(key)
+            should_remove = self._store.release_binding(automation_id, key)
+            if should_remove and binding:
+                target: int | str
+                if binding["target_group_id"] is not None:
+                    target = f"g{binding['target_group_id']}"
+                else:
+                    target = binding["target_node_id"] or 0
+                await self._remove_binding_from_device(
+                    binding["source_node_id"],
+                    binding["source_endpoint"],
+                    target,
+                    binding["target_endpoint"],
+                )
+
+        # Release ACLs
+        for key in list(resources["acl_keys"]):
+            acl = self._store.get_acl_resource(key)
+            should_remove = self._store.release_acl(automation_id, key)
+            if should_remove and acl:
+                await self._remove_acl_from_device(
+                    acl["target_node_id"],
+                    acl["source_node_id"],
+                )
+
+        # Release groups last
+        for key in list(resources["group_keys"]):
+            group = self._store.get_group_resource(key)
+            should_remove = self._store.release_group(automation_id, key)
+            if should_remove and group:
+                members = frozenset(
+                    (m["node_id"], m["endpoint_id"]) for m in group["members"]
+                )
+                await self._remove_group_from_devices(group["group_id"], members)
+
+        # Clear automation resources mapping
+        await self._store.async_clear_automation_resources(automation_id)
+
+    # =========================================================================
+    # Device Operations (Write/Remove to Matter devices)
+    # =========================================================================
+
+    async def _write_acl_to_device(
+        self, target_node_id: int, subject: int, auth_mode: int = 2
+    ) -> None:
+        """Write ACL entry to a Matter device.
+
+        Args:
+            target_node_id: The node to write the ACL to.
+            subject: The subject to grant access (node_id for CASE, group_id for GROUP).
+            auth_mode: The authentication mode:
+                2 = CASE (node-to-node unicast, subject is source node ID)
+                3 = GROUP (group multicast, subject is group ID)
+        """
+        try:
+            matter = get_matter(self._hass)
+            matter_client = matter.matter_client
+        except (KeyError, StopIteration):
+            LOGGER.warning("Matter integration not available for ACL write")
+            return
+
+        auth_mode_name = "GROUP" if auth_mode == 3 else "CASE"
+
+        try:
+            acl_path = "0/31/0"
+            LOGGER.debug(
+                "Reading current ACLs from node %d path %s", target_node_id, acl_path
+            )
+            current_acls = await matter_client.read_attribute(target_node_id, acl_path)
+            current_acl_list = current_acls.get(acl_path, [])
+            LOGGER.debug(
+                "Current ACLs on node %d: %d entries",
+                target_node_id,
+                len(current_acl_list),
+            )
+
+            # Get fabric ID and controller subject
+            server_info = matter_client.server_info
+            if server_info is None:
+                LOGGER.error("Matter server info not available")
+                return
+            fabric_id = server_info.fabric_id
+            # Controller subject is typically in compressed_fabric_id or we use a known value
+            # The admin ACL usually has privilege=5 and authMode=2 (CASE)
+
+            # In DEBUG_OVERWRITE_ACLS mode, we clean up duplicate/invalid entries
+            if DEBUG_OVERWRITE_ACLS:
+                LOGGER.warning(
+                    "⚠️ DEBUG_OVERWRITE_ACLS: Cleaning up ACLs on node %d",
+                    target_node_id,
+                )
+                # Keep only the controller's admin ACL (privilege 5, our fabric)
+                # and remove duplicates
+                cleaned_entries: list[dict[str, Any]] = []
+                seen_acls: set[tuple[int, int, tuple[int, ...]]] = set()
+
+                for acl_entry in current_acl_list:
+                    if not isinstance(acl_entry, dict):
+                        continue
+
+                    # Check for required fields
+                    if "1" not in acl_entry or "2" not in acl_entry:
+                        LOGGER.warning(
+                            "Removing invalid ACL entry (missing fields): %s", acl_entry
+                        )
+                        continue
+
+                    privilege = acl_entry.get("1", 0)
+                    entry_auth_mode = acl_entry.get("2", 0)
+                    subjects = tuple(acl_entry.get("3", []) or [])
+                    entry_fabric = acl_entry.get("254", 0)
+
+                    # Skip entries from other fabrics
+                    if entry_fabric != fabric_id:
+                        cleaned_entries.append(acl_entry)
+                        continue
+
+                    # Create a signature for deduplication
+                    sig = (privilege, entry_auth_mode, subjects)
+                    if sig in seen_acls:
+                        LOGGER.warning(
+                            "Removing duplicate ACL entry: privilege=%d, authMode=%d, subjects=%s",
+                            privilege,
+                            entry_auth_mode,
+                            subjects,
+                        )
+                        continue
+
+                    # Keep controller admin ACL (privilege 5)
+                    if privilege == 5:
+                        seen_acls.add(sig)
+                        cleaned_entries.append(acl_entry)
+                        LOGGER.debug("Keeping admin ACL: subjects=%s", subjects)
+                        continue
+
+                    # Remove all other Operate (privilege 3) ACLs - we'll add ours fresh
+                    LOGGER.info(
+                        "Removing stale ACL: privilege=%d, authMode=%d, subjects=%s",
+                        privilege,
+                        entry_auth_mode,
+                        subjects,
+                    )
+
+                current_acl_list = cleaned_entries
+                LOGGER.info(
+                    "After cleanup, node %d has %d ACL entries",
+                    target_node_id,
+                    len(cleaned_entries),
+                )
+            else:
+                # Normal mode: check if already exists
+                for acl_entry in current_acl_list:
+                    if isinstance(acl_entry, dict):
+                        subjects = acl_entry.get("3", []) or []
+                        entry_auth_mode = acl_entry.get("2", 0)
+                    else:
+                        subjects = getattr(acl_entry, "subjects", []) or []
+                        entry_auth_mode = getattr(acl_entry, "authMode", 0)
+                    if subject in subjects and entry_auth_mode == auth_mode:
+                        LOGGER.debug(
+                            "ACL already exists: subject %d, authMode %s on node %d",
+                            subject,
+                            auth_mode_name,
+                            target_node_id,
+                        )
+                        return
+
+                # Filter invalid entries
+                current_acl_list = [
+                    e
+                    for e in current_acl_list
+                    if (isinstance(e, dict) and "1" in e and "2" in e)
+                    or (hasattr(e, "privilege") and hasattr(e, "authMode"))
+                ]
+
+            # Create new ACL entry with correct authMode
+            # For GROUP auth (3), we also add endpoint targets
+            if auth_mode == 3:
+                # GROUP ACL - restrict to endpoint 1 (typical application endpoint)
+                new_acl_entry = {
+                    "254": fabric_id,
+                    "1": 3,  # Operate privilege
+                    "2": 3,  # GROUP authMode
+                    "3": [subject],  # group_id
+                    "4": [{"cluster": None, "endpoint": 1, "deviceType": None}],
+                }
+                LOGGER.info(
+                    "Creating GROUP ACL: fabric=%d, group_id=%d, authMode=GROUP (3)",
+                    fabric_id,
+                    subject,
+                )
+            else:
+                # CASE ACL - node-to-node (no target restriction)
+                new_acl_entry = {
+                    "254": fabric_id,
+                    "1": 3,  # Operate privilege
+                    "2": 2,  # CASE authMode
+                    "3": [subject],  # source_node_id
+                    "4": None,
+                }
+                LOGGER.info(
+                    "Creating CASE ACL: fabric=%d, node_id=%d, authMode=CASE (2)",
+                    fabric_id,
+                    subject,
+                )
+
+            updated_list = [*current_acl_list, new_acl_entry]
+            LOGGER.debug(
+                "Writing %d ACL entries to node %d", len(updated_list), target_node_id
+            )
+
+            await matter_client.write_attribute(
+                node_id=target_node_id,
+                attribute_path=acl_path,
+                value=updated_list,
+            )
+
+            # Verify write succeeded
+            verify_resp = await matter_client.read_attribute(target_node_id, acl_path)
+            verify_acl_list = verify_resp.get(acl_path, [])
+
+            # Check if our subject is now in the ACL with correct authMode
+            found = False
+            for acl_entry in verify_acl_list:
+                if isinstance(acl_entry, dict):
+                    subjects = acl_entry.get("3", []) or []
+                    entry_auth_mode = acl_entry.get("2", 0)
+                else:
+                    subjects = getattr(acl_entry, "subjects", []) or []
+                    entry_auth_mode = getattr(acl_entry, "authMode", 0)
+                if subject in subjects and entry_auth_mode == auth_mode:
+                    found = True
+                    break
+
+            if found:
+                LOGGER.info(
+                    "✓ ACL WRITE VERIFIED: node %d has %s ACL for subject %d",
+                    target_node_id,
+                    auth_mode_name,
+                    subject,
+                )
+            else:
+                LOGGER.error(
+                    "✗ ACL WRITE FAILED: node %d missing %s ACL for subject %d (total=%d)",
+                    target_node_id,
+                    auth_mode_name,
+                    subject,
+                    len(verify_acl_list),
+                )
+
+        except (HomeAssistantError, OSError, ValueError) as err:
+            LOGGER.error("Failed to write ACL: %s", err)
+
+    async def _remove_acl_from_device(
+        self, target_node_id: int, subject: int, auth_mode: int = 2
+    ) -> None:
+        """Remove ACL entry from a Matter device.
+
+        Args:
+            target_node_id: The node to remove ACL from.
+            subject: The subject to remove (node_id for CASE, group_id for GROUP).
+            auth_mode: The authentication mode (2=CASE, 3=GROUP).
+        """
+        try:
+            matter = get_matter(self._hass)
+            matter_client = matter.matter_client
+        except (KeyError, StopIteration):
+            return
+
+        auth_mode_name = "GROUP" if auth_mode == 3 else "CASE"
+
+        try:
+            acl_path = "0/31/0"
+            current_acls = await matter_client.read_attribute(target_node_id, acl_path)
+            current_acl_list = current_acls.get(acl_path, [])
+
+            # Filter out entries matching subject AND auth_mode
+            updated_list = []
+            for acl_entry in current_acl_list:
+                if isinstance(acl_entry, dict):
+                    subjects = acl_entry.get("3", []) or []
+                    entry_auth_mode = acl_entry.get("2", 0)
+                else:
+                    subjects = getattr(acl_entry, "subjects", []) or []
+                    entry_auth_mode = getattr(acl_entry, "authMode", 0)
+
+                # Keep entry if subject not in subjects OR auth_mode differs
+                if subject not in subjects or entry_auth_mode != auth_mode:
+                    updated_list.append(acl_entry)
+
+            if len(updated_list) < len(current_acl_list):
+                await matter_client.write_attribute(
+                    node_id=target_node_id,
+                    attribute_path=acl_path,
+                    value=updated_list,
+                )
+                LOGGER.info(
+                    "Removed %s ACL from node %d for subject %d",
+                    auth_mode_name,
+                    target_node_id,
+                    subject,
+                )
+
+        except (HomeAssistantError, OSError, ValueError) as err:
+            LOGGER.error("Failed to remove ACL: %s", err)
+
+    async def _write_binding_to_device(
+        self,
+        source_node_id: int,
+        source_endpoint: int,
+        target: int | str,
+        target_endpoint: int,
+    ) -> None:
+        """Write binding entry to a Matter device."""
+        try:
+            matter = get_matter(self._hass)
+            matter_client = matter.matter_client
+        except (KeyError, StopIteration):
+            LOGGER.warning("Matter integration not available for binding write")
+            return
+
+        try:
+            binding_path = f"{source_endpoint}/30/0"
+            LOGGER.info(
+                "Writing binding on node %d: ep %d -> target %s (ep %d)",
+                source_node_id,
+                source_endpoint,
+                target,
+                target_endpoint,
+            )
+            current_bindings_resp = await matter_client.read_attribute(
+                source_node_id, binding_path
+            )
+            current_bindings = current_bindings_resp.get(binding_path, [])
+            LOGGER.debug(
+                "Current bindings on node %d: %s", source_node_id, current_bindings
+            )
+
+            if not isinstance(current_bindings, list):
+                current_bindings = []
+
+            # Filter out invalid binding entries
+            valid_bindings = []
+            for binding in current_bindings:
+                if isinstance(binding, dict):
+                    # Valid binding must have fabric index (254) and either
+                    # node (1) for unicast or group (2) for group binding
+                    if "254" in binding and ("1" in binding or "2" in binding):
+                        valid_bindings.append(binding)
+                    else:
+                        LOGGER.warning(
+                            "Filtering invalid binding entry on node %d: %s",
+                            source_node_id,
+                            binding,
+                        )
+                elif hasattr(binding, "fabricIndex"):
+                    # Object format - check for node or group
+                    if hasattr(binding, "node") or hasattr(binding, "group"):
+                        valid_bindings.append(binding)
+                    else:
+                        LOGGER.warning(
+                            "Filtering invalid binding entry on node %d: %s",
+                            source_node_id,
+                            binding,
+                        )
+                else:
+                    LOGGER.warning(
+                        "Filtering invalid binding entry on node %d: %s",
+                        source_node_id,
+                        binding,
+                    )
+
+            # Get fabric ID
+            server_info = matter_client.server_info
+            if server_info is None:
+                LOGGER.error("Matter server info not available")
+                return
+            fabric_id = server_info.fabric_id
+
+            # Create binding entry
+            if isinstance(target, str) and target.startswith("g"):
+                # Group binding - only needs group ID and fabric
+                group_id = int(target[1:])
+                new_binding = {
+                    "254": fabric_id,
+                    "2": group_id,  # group field (index 2 in TargetStruct)
+                }
+                LOGGER.info(
+                    "Creating GROUP binding: node %d -> group %d",
+                    source_node_id,
+                    group_id,
+                )
+
+                # Check if this group binding already exists in valid bindings
+                for existing in valid_bindings:
+                    if isinstance(existing, dict) and existing.get("2") == group_id:
+                        LOGGER.info(
+                            "✓ Group binding to %d already exists on node %d, skipping",
+                            group_id,
+                            source_node_id,
+                        )
+                        return
+            else:
+                # Unicast binding
+                new_binding = {
+                    "254": fabric_id,
+                    "1": int(target),  # node field
+                    "3": target_endpoint,  # endpoint field
+                    "4": None,  # cluster field (None = all clusters)
+                }
+                LOGGER.info(
+                    "Creating UNICAST binding: node %d -> node %d ep %d",
+                    source_node_id,
+                    target,
+                    target_endpoint,
+                )
+
+                # Check if this unicast binding already exists in valid bindings
+                for existing in valid_bindings:
+                    if isinstance(existing, dict):
+                        if (
+                            existing.get("1") == int(target)
+                            and existing.get("3") == target_endpoint
+                        ):
+                            LOGGER.info(
+                                "✓ Unicast binding to node %d already exists on node %d, skipping",
+                                target,
+                                source_node_id,
+                            )
+                            return
+
+            # Use valid_bindings instead of current_bindings
+            updated_bindings = [*valid_bindings, new_binding]
+            LOGGER.debug(
+                "Writing %d bindings to node %d (was %d, filtered %d invalid): %s",
+                len(updated_bindings),
+                source_node_id,
+                len(current_bindings),
+                len(current_bindings) - len(valid_bindings),
+                updated_bindings,
+            )
+
+            await matter_client.write_attribute(
+                node_id=source_node_id,
+                attribute_path=binding_path,
+                value=updated_bindings,
+            )
+
+            # Verify write succeeded by reading back
+            verify_resp = await matter_client.read_attribute(
+                source_node_id, binding_path
+            )
+            verify_bindings = verify_resp.get(binding_path, [])
+            LOGGER.debug(
+                "After write, bindings on node %d: %s", source_node_id, verify_bindings
+            )
+
+            if len(verify_bindings) > len(current_bindings):
+                LOGGER.info(
+                    "✓ BINDING WRITE VERIFIED: node %d now has %d bindings (was %d)",
+                    source_node_id,
+                    len(verify_bindings),
+                    len(current_bindings),
+                )
+            else:
+                LOGGER.error(
+                    "✗ BINDING WRITE FAILED: node %d still has %d bindings (expected %d)",
+                    source_node_id,
+                    len(verify_bindings),
+                    len(updated_bindings),
+                )
+
+        except (HomeAssistantError, OSError, ValueError) as err:
+            LOGGER.error("Failed to write binding: %s", err)
+
+    async def _ensure_binding_on_device(
+        self,
+        source_node_id: int,
+        source_endpoint: int,
+        target: int | str,
+        target_endpoint: int,
+    ) -> None:
+        """Ensure a binding exists on a Matter device.
+
+        Checks if binding already exists on device before writing.
+        This fixes store/device sync issues from previous failed writes.
+        """
+        try:
+            matter = get_matter(self._hass)
+            matter_client = matter.matter_client
+        except (KeyError, StopIteration):
+            LOGGER.warning("Matter integration not available for binding check")
+            return
+
+        try:
+            binding_path = f"{source_endpoint}/30/0"
+            current_bindings_resp = await matter_client.read_attribute(
+                source_node_id, binding_path
+            )
+            current_bindings = current_bindings_resp.get(binding_path, [])
+
+            if not isinstance(current_bindings, list):
+                current_bindings = []
+
+            # Check if binding already exists on device
+            is_group = isinstance(target, str) and target.startswith("g")
+            target_value = int(target[1:]) if is_group else int(target)
+
+            binding_exists = False
+            for binding in current_bindings:
+                if isinstance(binding, dict):
+                    if is_group:
+                        if binding.get("2") == target_value:
+                            binding_exists = True
+                            break
+                    elif binding.get("1") == target_value:
+                        binding_exists = True
+                        break
+
+            if binding_exists:
+                LOGGER.debug(
+                    "Binding to %s already exists on node %d, skipping write",
+                    target,
+                    source_node_id,
+                )
+                return
+
+            # Binding doesn't exist, write it
+            LOGGER.info(
+                "Binding to %s not found on node %d, writing it now",
+                target,
+                source_node_id,
+            )
+            await self._write_binding_to_device(
+                source_node_id, source_endpoint, target, target_endpoint
+            )
+
+        except (HomeAssistantError, OSError, ValueError) as err:
+            LOGGER.error("Failed to ensure binding: %s", err)
+
+    async def _remove_binding_from_device(
+        self,
+        source_node_id: int,
+        source_endpoint: int,
+        target: int | str,
+        target_endpoint: int,
+    ) -> None:
+        """Remove binding entry from a Matter device."""
+        try:
+            matter = get_matter(self._hass)
+            matter_client = matter.matter_client
+        except (KeyError, StopIteration):
+            return
+
+        try:
+            binding_path = f"{source_endpoint}/30/0"
+            current_bindings_resp = await matter_client.read_attribute(
+                source_node_id, binding_path
+            )
+            current_bindings = current_bindings_resp.get(binding_path, [])
+
+            if not isinstance(current_bindings, list):
+                return
+
+            # Filter out the target binding
+            updated_bindings = []
+            is_group = isinstance(target, str) and target.startswith("g")
+            target_value = int(target[1:]) if is_group else int(target)
+
+            for binding in current_bindings:
+                if isinstance(binding, dict):
+                    if is_group:
+                        if binding.get("2") != target_value:
+                            updated_bindings.append(binding)
+                    elif binding.get("1") != target_value:
+                        updated_bindings.append(binding)
+                else:
+                    updated_bindings.append(binding)
+
+            if len(updated_bindings) < len(current_bindings):
+                await matter_client.write_attribute(
+                    node_id=source_node_id,
+                    attribute_path=binding_path,
+                    value=updated_bindings,
+                )
+                LOGGER.info(
+                    "Removed binding from node %d to %s", source_node_id, target
+                )
+
+        except (HomeAssistantError, OSError, ValueError) as err:
+            LOGGER.error("Failed to remove binding: %s", err)
+
+    async def _create_group_on_devices(
+        self,
+        group_id: int,
+        members: frozenset[tuple[int, int]],
+        source_nodes: list[NodeInfo] | None = None,
+    ) -> None:
+        """Create a Matter group on all member devices.
+
+        This involves:
+        1. Generating ONE shared Group Key
+        2. Writing the key to ALL nodes (sources AND targets)
+        3. Mapping the group ID to that key set via GroupKeyMap on ALL nodes
+        4. Calling AddGroup only on TARGET nodes (they join the group)
+        5. Saving the epoch key to the store for future member additions
+
+        Args:
+            group_id: The group ID.
+            members: Target nodes (node_id, endpoint_id) that join the group.
+            source_nodes: Source nodes that need the key to encrypt outgoing messages.
+        """
+        try:
+            matter = get_matter(self._hass)
+            matter_client = matter.matter_client
+        except (KeyError, StopIteration):
+            LOGGER.warning("Matter integration not available for group creation")
+            return
+
+        group_name = f"AutoBind-{group_id}"
+        key_set_index = (group_id % 3) + 1
+
+        # Generate ONE shared key for all nodes
+        epoch_key = secrets.token_bytes(16)
+        epoch_start_time = int(time.time() * 1_000_000)
+
+        LOGGER.info(
+            "Creating group %d with shared key (key=%s...) on %d targets + %d sources",
+            group_id,
+            epoch_key.hex()[:8],
+            len(members),
+            len(source_nodes) if source_nodes else 0,
+        )
+
+        # Save the epoch key to the store for future member additions
+        key = group_key(group_id)
+        self._store.update_group_epoch_key(key, epoch_key.hex(), key_set_index)
+
+        # Track source node IDs in the store
+        source_node_ids = [n.node_id for n in source_nodes] if source_nodes else []
+        self._store.update_group_source_nodes(key, source_node_ids)
+
+        # Collect all nodes that need the key
+        all_nodes_for_key: set[int] = set()
+
+        # Add source nodes (they need key to ENCRYPT outgoing messages)
+        if source_nodes:
+            for node_info in source_nodes:
+                all_nodes_for_key.add(node_info.node_id)
+
+        # Add target nodes (they need key to DECRYPT incoming messages)
+        for node_id, _ in members:
+            all_nodes_for_key.add(node_id)
+
+        # Step 1 & 2: Write KeySet and GroupKeyMap to ALL nodes (sources + targets)
+        for node_id in all_nodes_for_key:
+            await self._setup_group_key_on_node(
+                matter_client,
+                node_id,
+                group_id,
+                key_set_index,
+                epoch_key,
+                epoch_start_time,
+            )
+
+        # Step 3: Call AddGroup ONLY on TARGET nodes (they join the group)
+        # Source nodes do NOT join the group, they just have the key
+        for node_id, endpoint_id in members:
+            await self._add_node_to_group(
+                matter_client, node_id, endpoint_id, group_id, group_name
+            )
+
+    async def _setup_group_key_for_new_members(
+        self,
+        group_id: int,
+        new_members: frozenset[tuple[int, int]],
+        source_nodes: list[NodeInfo] | None = None,
+    ) -> None:
+        """Set up GroupKeyMap on new members using stored epoch key.
+
+        When a group already exists and new members are added, we need to
+        write the KeySet and GroupKeyMap to the new devices before calling AddGroup.
+
+        Args:
+            group_id: The group ID.
+            new_members: New members (node_id, endpoint_id) being added.
+            source_nodes: Source nodes that also need the key (if new).
+        """
+        # Get the stored epoch key for this group
+        key = group_key(group_id)
+        group_resource = self._store.get_group_resource(key)
+        if not group_resource:
+            LOGGER.warning("Group %s not found in store, cannot propagate key", key)
+            return
+
+        epoch_key_hex = group_resource.get("epoch_key")
+        key_set_index = group_resource.get("key_set_index")
+
+        if not epoch_key_hex or not key_set_index:
+            LOGGER.warning(
+                "Group %s missing epoch_key or key_set_index, regenerating",
+                key,
+            )
+            # If missing, we need to regenerate - this shouldn't happen normally
+            # but handles edge case of upgraded stores without these fields
+            return
+
+        try:
+            matter = get_matter(self._hass)
+            matter_client = matter.matter_client
+        except (KeyError, StopIteration):
+            LOGGER.warning("Matter integration not available for group key setup")
+            return
+
+        epoch_key = bytes.fromhex(epoch_key_hex)
+        epoch_start_time = int(time.time() * 1_000_000)
+
+        LOGGER.info(
+            "Propagating group %d key (key=%s...) to %d new members",
+            group_id,
+            epoch_key_hex[:8],
+            len(new_members),
+        )
+
+        # Collect all nodes that need the key
+        nodes_needing_key: set[int] = set()
+
+        # Add new member nodes
+        for node_id, _ in new_members:
+            nodes_needing_key.add(node_id)
+
+        # Add source nodes if they're new (check if they already have the key)
+        if source_nodes:
+            for node_info in source_nodes:
+                nodes_needing_key.add(node_info.node_id)
+
+        # Set up key on each node
+        for node_id in nodes_needing_key:
+            await self._setup_group_key_on_node(
+                matter_client,
+                node_id,
+                group_id,
+                key_set_index,
+                epoch_key,
+                epoch_start_time,
+            )
+
+    async def _setup_group_key_for_sources(
+        self,
+        group_id: int,
+        source_node_ids: set[int],
+    ) -> None:
+        """Set up GroupKeyMap on new source nodes.
+
+        Source nodes need the GroupKeyMap to ENCRYPT messages to the group,
+        but they do NOT join the group (no AddGroup call).
+
+        Args:
+            group_id: The group ID.
+            source_node_ids: Node IDs of new sources needing the key.
+        """
+        key = group_key(group_id)
+        group_resource = self._store.get_group_resource(key)
+        if not group_resource:
+            LOGGER.warning("Group %s not found, cannot setup source keys", key)
+            return
+
+        epoch_key_hex = group_resource.get("epoch_key")
+        key_set_index = group_resource.get("key_set_index")
+
+        if not epoch_key_hex or not key_set_index:
+            LOGGER.warning("Group %s missing epoch_key, cannot setup source keys", key)
+            return
+
+        try:
+            matter = get_matter(self._hass)
+            matter_client = matter.matter_client
+        except (KeyError, StopIteration):
+            LOGGER.warning("Matter integration not available")
+            return
+
+        epoch_key = bytes.fromhex(epoch_key_hex)
+        epoch_start_time = int(time.time() * 1_000_000)
+
+        LOGGER.info(
+            "Adding GroupKeyMap for group %d to %d new source(s): %s",
+            group_id,
+            len(source_node_ids),
+            source_node_ids,
+        )
+
+        for node_id in source_node_ids:
+            await self._setup_group_key_on_node(
+                matter_client,
+                node_id,
+                group_id,
+                key_set_index,
+                epoch_key,
+                epoch_start_time,
+            )
+
+    async def _remove_group_key_from_sources(
+        self,
+        group_id: int,
+        source_node_ids: set[int],
+    ) -> None:
+        """Remove GroupKeyMap from old source nodes.
+
+        When sources are no longer controlling the group, remove the key.
+
+        Args:
+            group_id: The group ID.
+            source_node_ids: Node IDs of old sources to remove key from.
+        """
+        try:
+            matter = get_matter(self._hass)
+            matter_client = matter.matter_client
+        except (KeyError, StopIteration):
+            LOGGER.warning("Matter integration not available")
+            return
+
+        LOGGER.info(
+            "Removing GroupKeyMap for group %d from %d old source(s): %s",
+            group_id,
+            len(source_node_ids),
+            source_node_ids,
+        )
+
+        for node_id in source_node_ids:
+            await self._remove_group_key_from_node(matter_client, node_id, group_id)
+
+    async def _remove_group_key_from_node(
+        self,
+        matter_client: Any,
+        node_id: int,
+        group_id: int,
+    ) -> None:
+        """Remove a group's KeyMap entry from a node.
+
+        Args:
+            matter_client: The Matter client.
+            node_id: The node to remove key from.
+            group_id: The group ID to remove.
+        """
+        gkm_path = "0/63/0"
+
+        try:
+            # Read current GroupKeyMap
+            current_map_resp = await matter_client.read_attribute(node_id, gkm_path)
+            current_map = current_map_resp.get(gkm_path, [])
+
+            if not current_map:
+                return
+
+            # Filter out the entry for this group
+            updated_map = []
+            removed = False
+            for entry in current_map:
+                entry_group_id = None
+                if isinstance(entry, dict):
+                    entry_group_id = entry.get("1")
+                elif hasattr(entry, "groupId"):
+                    entry_group_id = entry.groupId
+
+                if entry_group_id == group_id:
+                    removed = True
+                    LOGGER.debug(
+                        "Removing GroupKeyMap entry for group %d from node %d",
+                        group_id,
+                        node_id,
+                    )
+                else:
+                    updated_map.append(entry)
+
+            if removed:
+                await matter_client.write_attribute(
+                    node_id=node_id,
+                    attribute_path=gkm_path,
+                    value=updated_map,
+                )
+                LOGGER.info(
+                    "✓ Removed GroupKeyMap for group %d from node %d",
+                    group_id,
+                    node_id,
+                )
+
+        except (HomeAssistantError, OSError, ValueError) as err:
+            LOGGER.warning(
+                "Failed to remove GroupKeyMap for group %d from node %d: %s",
+                group_id,
+                node_id,
+                err,
+            )
+
+    async def _remove_group_completely(
+        self,
+        group_id: int,
+        members: frozenset[tuple[int, int]],
+    ) -> None:
+        """Remove a group completely from all devices (targets AND sources).
+
+        Args:
+            group_id: The group ID to remove.
+            members: The target members (node_id, endpoint_id).
+        """
+        try:
+            matter = get_matter(self._hass)
+            matter_client = matter.matter_client
+        except (KeyError, StopIteration):
+            LOGGER.warning("Matter integration not available for group removal")
+            return
+
+        # Get source nodes from store
+        key = group_key(group_id)
+        group_resource = self._store.get_group_resource(key)
+        source_node_ids = (
+            set(group_resource.get("source_nodes", [])) if group_resource else set()
+        )
+
+        LOGGER.info(
+            "Removing group %d completely: %d targets, %d sources",
+            group_id,
+            len(members),
+            len(source_node_ids),
+        )
+
+        # Remove from target members (RemoveGroup + remove GroupKeyMap)
+        for node_id, endpoint_id in members:
+            await self._remove_device_from_group(group_id, node_id, endpoint_id)
+            await self._remove_group_key_from_node(matter_client, node_id, group_id)
+
+        # Remove GroupKeyMap from sources (they were never in the group)
+        for node_id in source_node_ids:
+            await self._remove_group_key_from_node(matter_client, node_id, group_id)
+
+    async def _setup_group_key_on_node(
+        self,
+        matter_client: Any,
+        node_id: int,
+        group_id: int,
+        key_set_index: int,
+        epoch_key: bytes,
+        epoch_start_time: int,
+    ) -> None:
+        """Set up group key on a single node (KeySetWrite + GroupKeyMap)."""
+        gkm_path = "0/63/0"
+
+        try:
+            # Read current GroupKeyMap
+            try:
+                current_map_resp = await matter_client.read_attribute(node_id, gkm_path)
+                current_map = current_map_resp.get(gkm_path, [])
+                LOGGER.debug("Node %d current GroupKeyMap: %s", node_id, current_map)
+            except (HomeAssistantError, OSError, ValueError):
+                current_map = []
+
+            # Filter out invalid entries from current map
+            valid_entries = []
+            for entry in current_map:
+                if isinstance(entry, dict):
+                    # Dict format: must have groupId (key "1") and groupKeySetID (key "2")
+                    if "1" in entry and "2" in entry:
+                        valid_entries.append(entry)
+                    else:
+                        LOGGER.warning(
+                            "Filtering invalid GroupKeyMap entry on node %d: %s",
+                            node_id,
+                            entry,
+                        )
+                elif hasattr(entry, "groupId") and hasattr(entry, "groupKeySetID"):
+                    # Object format
+                    valid_entries.append(entry)
+                else:
+                    LOGGER.warning(
+                        "Filtering invalid GroupKeyMap entry on node %d: %s",
+                        node_id,
+                        entry,
+                    )
+
+            # Check if group is already mapped
+            group_already_mapped = False
+            for entry in valid_entries:
+                if isinstance(entry, dict):
+                    if entry.get("1") == group_id:
+                        group_already_mapped = True
+                        break
+                elif hasattr(entry, "groupId") and entry.groupId == group_id:
+                    group_already_mapped = True
+                    break
+
+            if group_already_mapped:
+                LOGGER.debug(
+                    "Group %d already mapped on node %d, skipping", group_id, node_id
+                )
+                return
+
+            # Write KeySet
+            try:
+                key_set = Clusters.GroupKeyManagement.Structs.GroupKeySetStruct(
+                    groupKeySetID=key_set_index,
+                    groupKeySecurityPolicy=Clusters.GroupKeyManagement.Enums.GroupKeySecurityPolicyEnum.kTrustFirst,
+                    epochKey0=epoch_key,
+                    epochStartTime0=epoch_start_time,
+                    epochKey1=None,
+                    epochStartTime1=None,
+                    epochKey2=None,
+                    epochStartTime2=None,
+                )
+                LOGGER.debug(
+                    "Writing KeySet %d to node %d (key=%s...)",
+                    key_set_index,
+                    node_id,
+                    epoch_key.hex()[:8],
+                )
+                await matter_client.send_device_command(
+                    node_id=node_id,
+                    endpoint_id=0,
+                    command=Clusters.GroupKeyManagement.Commands.KeySetWrite(
+                        groupKeySet=key_set
+                    ),
+                )
+                LOGGER.info("✓ KeySetWrite succeeded on node %d", node_id)
+            except (HomeAssistantError, OSError, ValueError) as err:
+                LOGGER.warning("KeySetWrite on node %d failed: %s", node_id, err)
+
+            # Write GroupKeyMap (using filtered valid entries)
+            try:
+                new_map_entry = Clusters.GroupKeyManagement.Structs.GroupKeyMapStruct(
+                    groupId=group_id,
+                    groupKeySetID=key_set_index,
+                    fabricIndex=0,
+                )
+                updated_map = [*valid_entries, new_map_entry]
+                LOGGER.debug(
+                    "Writing GroupKeyMap on node %d: %d entries",
+                    node_id,
+                    len(updated_map),
+                )
+                await matter_client.write_attribute(
+                    node_id=node_id,
+                    attribute_path=gkm_path,
+                    value=updated_map,
+                )
+
+                # Verify write by reading back
+                verify_resp = await matter_client.read_attribute(node_id, gkm_path)
+                verify_map = verify_resp.get(gkm_path, [])
+
+                # Check if our group is now in the map
+                found = False
+                for entry in verify_map:
+                    if isinstance(entry, dict):
+                        if entry.get("1") == group_id:
+                            found = True
+                            break
+                    elif hasattr(entry, "groupId") and entry.groupId == group_id:
+                        found = True
+                        break
+
+                if found:
+                    LOGGER.info(
+                        "✓ GroupKeyMap VERIFIED: node %d has group %d mapped",
+                        node_id,
+                        group_id,
+                    )
+                else:
+                    LOGGER.error(
+                        "✗ GroupKeyMap WRITE FAILED: node %d does not have group %d after write",
+                        node_id,
+                        group_id,
+                    )
+
+            except (HomeAssistantError, OSError, ValueError) as err:
+                LOGGER.warning(
+                    "Failed to write GroupKeyMap on node %d: %s", node_id, err
+                )
+
+        except (HomeAssistantError, OSError, ValueError) as err:
+            LOGGER.error("Failed to setup group key on node %d: %s", node_id, err)
+
+    async def _add_node_to_group(
+        self,
+        matter_client: Any,
+        node_id: int,
+        endpoint_id: int,
+        group_id: int,
+        group_name: str,
+    ) -> None:
+        """Add a node to a group (AddGroup command)."""
+        try:
+            LOGGER.debug(
+                "Sending AddGroup(groupID=%d) to node %d endpoint %d",
+                group_id,
+                node_id,
+                endpoint_id,
+            )
+            response = await matter_client.send_device_command(
+                node_id=node_id,
+                endpoint_id=endpoint_id,
+                command=Clusters.Groups.Commands.AddGroup(
+                    groupID=group_id,
+                    groupName=group_name,
+                ),
+            )
+            LOGGER.debug("AddGroup response from node %d: %s", node_id, response)
+
+            # Check status
+            add_status = None
+            if isinstance(response, dict):
+                add_status = response.get("status")
+            elif hasattr(response, "status"):
+                add_status = response.status
+
+            if add_status == 0:
+                LOGGER.info(
+                    "✓ AddGroup SUCCESS: node %d endpoint %d added to group %d",
+                    node_id,
+                    endpoint_id,
+                    group_id,
+                )
+            else:
+                LOGGER.warning(
+                    "✗ AddGroup FAILED: node %d endpoint %d status=%s",
+                    node_id,
+                    endpoint_id,
+                    add_status,
+                )
+
+            # Verify with GetGroupMembership
+            verify_response = await matter_client.send_device_command(
+                node_id=node_id,
+                endpoint_id=endpoint_id,
+                command=Clusters.Groups.Commands.GetGroupMembership(
+                    groupList=[group_id]
+                ),
+            )
+
+            group_list = []
+            if isinstance(verify_response, dict):
+                group_list = verify_response.get("groupList", [])
+            elif hasattr(verify_response, "groupList"):
+                group_list = verify_response.groupList or []
+
+            if group_id in group_list:
+                LOGGER.info(
+                    "✓ GROUP VERIFIED: node %d endpoint %d is member of group %d",
+                    node_id,
+                    endpoint_id,
+                    group_id,
+                )
+            else:
+                LOGGER.warning(
+                    "✗ GROUP UNVERIFIED: node %d endpoint %d not in group %d",
+                    node_id,
+                    endpoint_id,
+                    group_id,
+                )
+
+        except (HomeAssistantError, OSError, ValueError) as err:
+            LOGGER.error(
+                "Failed to add node %d to group %d: %s", node_id, group_id, err
+            )
+
+    async def _add_device_to_group(
+        self,
+        group_id: int,
+        node_id: int,
+        endpoint_id: int,
+    ) -> None:
+        """Add a single device to a Matter group."""
+        try:
+            matter = get_matter(self._hass)
+            matter_client = matter.matter_client
+
+            await matter_client.send_device_command(
+                node_id=node_id,
+                endpoint_id=endpoint_id,
+                command=Clusters.Groups.Commands.AddGroup(
+                    groupID=group_id,
+                    groupName=f"AutoBind-{group_id}",
+                ),
+            )
+            LOGGER.info("Added node %d to group %d", node_id, group_id)
+        except (
+            HomeAssistantError,
+            OSError,
+            ValueError,
+            KeyError,
+            StopIteration,
+        ) as err:
+            LOGGER.error("Failed to add node %d to group: %s", node_id, err)
+
+    async def _remove_device_from_group(
+        self,
+        group_id: int,
+        node_id: int,
+        endpoint_id: int,
+    ) -> None:
+        """Remove a single device from a Matter group."""
+        try:
+            matter = get_matter(self._hass)
+            matter_client = matter.matter_client
+
+            await matter_client.send_device_command(
+                node_id=node_id,
+                endpoint_id=endpoint_id,
+                command=Clusters.Groups.Commands.RemoveGroup(groupID=group_id),
+            )
+            LOGGER.info("Removed node %d from group %d", node_id, group_id)
+        except (
+            HomeAssistantError,
+            OSError,
+            ValueError,
+            KeyError,
+            StopIteration,
+        ) as err:
+            LOGGER.error("Failed to remove node %d from group: %s", node_id, err)
+
+    async def _remove_group_from_devices(
+        self,
+        group_id: int,
+        members: frozenset[tuple[int, int]],
+    ) -> None:
+        """Remove a Matter group from all member devices."""
+        for node_id, endpoint_id in members:
+            await self._remove_device_from_group(group_id, node_id, endpoint_id)

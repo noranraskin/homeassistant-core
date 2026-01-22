@@ -1,4 +1,9 @@
-"""Storage for Matter AutoBind integration."""
+"""Storage for Matter AutoBind integration.
+
+This module provides reference-counted resource management for ACLs, bindings,
+and Matter groups. Resources are shared across automations with safe cleanup
+when reference counts reach zero.
+"""
 
 from __future__ import annotations
 
@@ -9,7 +14,18 @@ from typing import TypedDict
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.storage import Store
 
-from .const import LOGGER, STORAGE_KEY, STORAGE_VERSION
+from .const import (
+    AUTOBIND_GROUP_ID_MAX,
+    AUTOBIND_GROUP_ID_START,
+    DEBUG_RESET_STORE,
+    LOGGER,
+    STORAGE_KEY,
+    STORAGE_VERSION,
+)
+
+# =============================================================================
+# Eligibility Status
+# =============================================================================
 
 
 class EligibilityStatus(StrEnum):
@@ -43,6 +59,47 @@ class EligibilityStatus(StrEnum):
     """Automation has not been checked yet."""
 
 
+# =============================================================================
+# Resource Key Generation Helpers
+# =============================================================================
+
+
+def acl_key(target_node_id: int, source_node_id: int, endpoint_id: int = 0) -> str:
+    """Generate a unique key for an ACL resource."""
+    return f"acl:{target_node_id}:{source_node_id}:{endpoint_id}"
+
+
+def binding_key(
+    source_node_id: int,
+    source_endpoint: int,
+    target: int | str,  # node_id (int) or group ref like "g12345" (str)
+    target_endpoint: int,
+) -> str:
+    """Generate a unique key for a binding resource."""
+    return f"bind:{source_node_id}:{source_endpoint}:{target}:{target_endpoint}"
+
+
+def group_key(group_id: int) -> str:
+    """Generate a unique key for a group resource."""
+    return f"group:{group_id}"
+
+
+def parse_binding_target(target: int | str) -> tuple[int | None, int | None]:
+    """Parse binding target into (node_id, group_id).
+
+    Returns:
+        Tuple of (node_id, group_id) where one is always None.
+    """
+    if isinstance(target, str) and target.startswith("g"):
+        return None, int(target[1:])
+    return int(target), None
+
+
+# =============================================================================
+# TypedDicts for Storage
+# =============================================================================
+
+
 class EligibilityResultDict(TypedDict):
     """TypedDict for eligibility check result."""
 
@@ -52,8 +109,9 @@ class EligibilityResultDict(TypedDict):
     reason: str
 
 
+# Backwards-compatible TypedDicts for legacy manager.py code
 class BindingEntryDict(TypedDict):
-    """TypedDict for a binding entry."""
+    """TypedDict for a binding entry (legacy compatibility)."""
 
     client_node_id: int
     client_endpoint: int
@@ -63,34 +121,131 @@ class BindingEntryDict(TypedDict):
 
 
 class AclEntryDict(TypedDict):
-    """TypedDict for tracking an ACL entry created by this integration.
-
-    This stores enough information to identify and remove the ACL entry
-    when an automation is deleted.
-    """
+    """TypedDict for tracking an ACL entry (legacy compatibility)."""
 
     target_node_id: int
-    """The node ID of the target device (where the ACL was created)."""
+    source_node_id: int
+    endpoint_id: int
+    acl_index: int | None
+
+
+class AclResourceDict(TypedDict):
+    """A normalized ACL resource with reference counting."""
+
+    target_node_id: int
+    """Node where ACL exists."""
 
     source_node_id: int
-    """The node ID of the source device (granted access by the ACL)."""
+    """Node granted access."""
 
     endpoint_id: int
-    """The endpoint on the target device."""
+    """Endpoint (usually 0)."""
 
-    acl_index: int | None
-    """The index of the ACL entry (if known, for removal)."""
+    ref_count: int
+    """Number of automations using this ACL."""
+
+    automation_ids: list[str]
+    """Which automations reference this."""
 
 
-class StoredDataDict(TypedDict):
-    """TypedDict for the stored data structure."""
+class BindingResourceDict(TypedDict):
+    """A normalized binding resource with reference counting."""
 
+    source_node_id: int
+    """Node where binding is written."""
+
+    source_endpoint: int
+    """Endpoint with binding cluster."""
+
+    target_node_id: int | None
+    """Target node (unicast) - None for group."""
+
+    target_group_id: int | None
+    """Target group (multicast) - None for unicast."""
+
+    target_endpoint: int
+    """Target endpoint."""
+
+    cluster_ids: list[int]
+    """Specific clusters or empty for all."""
+
+    ref_count: int
+    """Number of automations using this binding."""
+
+    automation_ids: list[str]
+    """Which automations reference this."""
+
+
+class GroupMemberDict(TypedDict):
+    """A group member (node + endpoint)."""
+
+    node_id: int
+    endpoint_id: int
+
+
+class GroupResourceDict(TypedDict):
+    """A Matter group managed by this integration."""
+
+    group_id: int
+    """The Matter group ID."""
+
+    group_name: str
+    """Name for the group (stored on devices)."""
+
+    members: list[GroupMemberDict]
+    """Target nodes that are members of this group (receive group messages)."""
+
+    source_nodes: list[int]
+    """Source node IDs that have GroupKeyMap for this group (send group messages)."""
+
+    epoch_key: str | None
+    """Hex-encoded 16-byte epoch key for this group (for key distribution)."""
+
+    key_set_index: int | None
+    """Key set index used for this group (1-3)."""
+
+    ref_count: int
+    """Number of automations using this group."""
+
+    automation_ids: list[str]
+    """Which automations reference this."""
+
+
+class AutomationResourcesDict(TypedDict):
+    """Track which resources an automation uses."""
+
+    acl_keys: list[str]
+    """Keys into acl_resources."""
+
+    binding_keys: list[str]
+    """Keys into binding_resources."""
+
+    group_keys: list[str]
+    """Keys into group_resources."""
+
+
+class StoredDataDict(TypedDict, total=False):
+    """TypedDict for the stored data structure.
+
+    Uses total=False to allow optional fields for backwards compatibility.
+    """
+
+    # Core tracking
     scanned_automation_ids: list[str]
-    supported_devices: list[int]
-    managed_bindings: dict[str, list[BindingEntryDict]]
-    managed_acls: dict[str, list[AclEntryDict]]
-    retry_queue: list[BindingEntryDict]
     eligibility_results: dict[str, EligibilityResultDict]
+
+    # New: Normalized resource storage with reference counting
+    acl_resources: dict[str, AclResourceDict]
+    binding_resources: dict[str, BindingResourceDict]
+    group_resources: dict[str, GroupResourceDict]
+
+    # New: Automation → Resources mapping
+    automation_resources: dict[str, AutomationResourcesDict]
+
+
+# =============================================================================
+# Data Classes
+# =============================================================================
 
 
 @dataclass
@@ -100,30 +255,33 @@ class MatterBindingStoreData:
     scanned_automation_ids: set[str] = field(default_factory=set)
     """Set of automation IDs that have been scanned."""
 
-    supported_devices: list[int] = field(default_factory=list)
-    """List of Matter Node IDs that support binding (have Binding Cluster)."""
-
-    managed_bindings: dict[str, list[BindingEntryDict]] = field(default_factory=dict)
-    """Map of automation_id -> list of binding entries created for that automation."""
-
-    managed_acls: dict[str, list[AclEntryDict]] = field(default_factory=dict)
-    """Map of automation_id -> list of ACL entries created for that automation."""
-
-    retry_queue: list[BindingEntryDict] = field(default_factory=list)
-    """List of binding entries that failed and should be retried."""
-
     eligibility_results: dict[str, EligibilityResultDict] = field(default_factory=dict)
     """Map of automation_id -> eligibility check result."""
+
+    # Normalized resource storage with reference counting
+    acl_resources: dict[str, AclResourceDict] = field(default_factory=dict)
+    """Map of acl_key -> ACL resource with ref counting."""
+
+    binding_resources: dict[str, BindingResourceDict] = field(default_factory=dict)
+    """Map of binding_key -> binding resource with ref counting."""
+
+    group_resources: dict[str, GroupResourceDict] = field(default_factory=dict)
+    """Map of group_key -> group resource with ref counting."""
+
+    automation_resources: dict[str, AutomationResourcesDict] = field(
+        default_factory=dict
+    )
+    """Map of automation_id -> resources used by that automation."""
 
     def to_dict(self) -> StoredDataDict:
         """Convert dataclass to a dictionary for storage."""
         return StoredDataDict(
             scanned_automation_ids=list(self.scanned_automation_ids),
-            supported_devices=self.supported_devices,
-            managed_bindings=self.managed_bindings,
-            managed_acls=self.managed_acls,
-            retry_queue=self.retry_queue,
             eligibility_results=self.eligibility_results,
+            acl_resources=self.acl_resources,
+            binding_resources=self.binding_resources,
+            group_resources=self.group_resources,
+            automation_resources=self.automation_resources,
         )
 
     @classmethod
@@ -131,26 +289,33 @@ class MatterBindingStoreData:
         """Create dataclass from stored dictionary."""
         if data is None:
             return cls()
+
         return cls(
             scanned_automation_ids=set(data.get("scanned_automation_ids", [])),
-            supported_devices=data.get("supported_devices", []),
-            managed_bindings=data.get("managed_bindings", {}),
-            managed_acls=data.get("managed_acls", {}),
-            retry_queue=data.get("retry_queue", []),
             eligibility_results=data.get("eligibility_results", {}),
+            acl_resources=data.get("acl_resources", {}),
+            binding_resources=data.get("binding_resources", {}),
+            group_resources=data.get("group_resources", {}),
+            automation_resources=data.get("automation_resources", {}),
         )
 
 
+# =============================================================================
+# Store Class
+# =============================================================================
+
+
 class MatterBindingStore:
-    """Store for Matter AutoBind data.
+    """Store for Matter AutoBind data with reference-counted resources.
 
     This class handles persistence of binding state using Home Assistant's
     storage helper. It tracks:
     - Which automations have been scanned
-    - Which devices support Matter binding
-    - Active bindings created from automations
-    - Failed binding attempts for retry
     - Eligibility check results
+    - ACL resources with reference counting
+    - Binding resources with reference counting
+    - Group resources with reference counting
+    - Automation -> resource mappings for cleanup
     """
 
     def __init__(self, hass: HomeAssistant) -> None:
@@ -165,10 +330,25 @@ class MatterBindingStore:
         """Return the current store data."""
         return self._data
 
+    # =========================================================================
+    # Load / Save
+    # =========================================================================
+
     async def async_load(self) -> None:
         """Load data from storage."""
         if self._loaded:
             LOGGER.debug("Store already loaded, skipping")
+            return
+
+        # Check for debug reset flag BEFORE loading
+        if DEBUG_RESET_STORE:
+            LOGGER.warning("⚠️ DEBUG_RESET_STORE is enabled! Wiping all store data...")
+            self._data = MatterBindingStoreData()
+            self._loaded = True
+            await self.async_save()
+            LOGGER.warning(
+                "⚠️ Store has been reset. Set DEBUG_RESET_STORE=False and restart."
+            )
             return
 
         LOGGER.debug("Loading Matter AutoBind store from disk")
@@ -176,10 +356,12 @@ class MatterBindingStore:
         self._data = MatterBindingStoreData.from_dict(stored)
         self._loaded = True
         LOGGER.info(
-            "Loaded Matter AutoBind store: %d scanned automations, %d managed bindings, %d eligibility results",
+            "Loaded Matter AutoBind store: %d scanned automations, "
+            "%d ACL resources, %d binding resources, %d group resources",
             len(self._data.scanned_automation_ids),
-            len(self._data.managed_bindings),
-            len(self._data.eligibility_results),
+            len(self._data.acl_resources),
+            len(self._data.binding_resources),
+            len(self._data.group_resources),
         )
 
     async def async_save(self) -> None:
@@ -187,28 +369,18 @@ class MatterBindingStore:
         LOGGER.debug("Saving Matter AutoBind store to disk")
         await self._store.async_save(self._data.to_dict())
 
+    # =========================================================================
+    # Eligibility Tracking
+    # =========================================================================
+
     def is_automation_scanned(self, automation_id: str) -> bool:
-        """Check if an automation has already been scanned.
-
-        Args:
-            automation_id: The entity_id of the automation.
-
-        Returns:
-            True if the automation has been scanned, False otherwise.
-        """
+        """Check if an automation has already been scanned."""
         return automation_id in self._data.scanned_automation_ids
 
     def get_eligibility_result(
         self, automation_id: str
     ) -> EligibilityResultDict | None:
-        """Get the eligibility result for an automation.
-
-        Args:
-            automation_id: The entity_id of the automation.
-
-        Returns:
-            The eligibility result, or None if not checked.
-        """
+        """Get the eligibility result for an automation."""
         return self._data.eligibility_results.get(automation_id)
 
     async def async_set_eligibility_result(
@@ -219,15 +391,7 @@ class MatterBindingStore:
         action_entities: list[str],
         reason: str,
     ) -> None:
-        """Set the eligibility result for an automation.
-
-        Args:
-            automation_id: The entity_id of the automation.
-            status: The eligibility status.
-            trigger_entities: List of trigger entity IDs.
-            action_entities: List of action entity IDs.
-            reason: Human-readable reason for the status.
-        """
+        """Set the eligibility result for an automation."""
         self._data.eligibility_results[automation_id] = EligibilityResultDict(
             status=status.value,
             trigger_entities=trigger_entities,
@@ -243,141 +407,549 @@ class MatterBindingStore:
         await self.async_save()
 
     async def async_mark_automation_scanned(self, automation_id: str) -> None:
-        """Mark an automation as scanned and persist.
-
-        Args:
-            automation_id: The entity_id of the automation.
-        """
+        """Mark an automation as scanned and persist."""
         if automation_id not in self._data.scanned_automation_ids:
             self._data.scanned_automation_ids.add(automation_id)
             LOGGER.debug("Marked automation %s as scanned", automation_id)
             await self.async_save()
 
     async def async_clear_scanned_automation(self, automation_id: str) -> None:
-        """Remove an automation from the scanned set.
-
-        Useful when an automation is updated and needs re-scanning.
-
-        Args:
-            automation_id: The entity_id of the automation.
-        """
+        """Remove an automation from the scanned set."""
         if automation_id in self._data.scanned_automation_ids:
             self._data.scanned_automation_ids.discard(automation_id)
             LOGGER.debug("Cleared scanned status for automation %s", automation_id)
             await self.async_save()
 
-    async def async_add_binding(
-        self, automation_id: str, binding: BindingEntryDict
-    ) -> None:
-        """Add a binding entry for an automation.
+    # =========================================================================
+    # Automation Resource Tracking
+    # =========================================================================
 
-        Args:
-            automation_id: The entity_id of the automation.
-            binding: The binding entry details.
-        """
-        if automation_id not in self._data.managed_bindings:
-            self._data.managed_bindings[automation_id] = []
-        self._data.managed_bindings[automation_id].append(binding)
-        LOGGER.debug(
-            "Added binding for automation %s: client=%d -> target=%d",
-            automation_id,
-            binding["client_node_id"],
-            binding["target_node_id"],
-        )
-        await self.async_save()
-
-    async def async_remove_bindings_for_automation(
+    def get_automation_resources(
         self, automation_id: str
-    ) -> list[BindingEntryDict]:
-        """Remove all bindings for an automation.
+    ) -> AutomationResourcesDict | None:
+        """Get the resources used by an automation."""
+        return self._data.automation_resources.get(automation_id)
 
-        Args:
-            automation_id: The entity_id of the automation.
-
-        Returns:
-            List of removed binding entries.
-        """
-        bindings = self._data.managed_bindings.pop(automation_id, [])
-        if bindings:
-            LOGGER.debug(
-                "Removed %d bindings for automation %s", len(bindings), automation_id
+    def _ensure_automation_resources(self, automation_id: str) -> None:
+        """Ensure automation resources entry exists."""
+        if automation_id not in self._data.automation_resources:
+            self._data.automation_resources[automation_id] = AutomationResourcesDict(
+                acl_keys=[],
+                binding_keys=[],
+                group_keys=[],
             )
+
+    async def async_clear_automation_resources(self, automation_id: str) -> None:
+        """Clear the automation resources mapping (not the resources themselves)."""
+        if automation_id in self._data.automation_resources:
+            del self._data.automation_resources[automation_id]
             await self.async_save()
-        return bindings
 
-    async def async_add_to_retry_queue(self, binding: BindingEntryDict) -> None:
-        """Add a failed binding to the retry queue.
+    # =========================================================================
+    # Group ID Allocation
+    # =========================================================================
 
-        Args:
-            binding: The binding entry that failed.
-        """
-        self._data.retry_queue.append(binding)
-        LOGGER.debug(
-            "Added binding to retry queue: client=%d -> target=%d",
-            binding["client_node_id"],
-            binding["target_node_id"],
-        )
-        await self.async_save()
-
-    async def async_clear_retry_queue(self) -> list[BindingEntryDict]:
-        """Clear and return the retry queue.
+    def allocate_group_id(self) -> int:
+        """Allocate a new unique group ID.
 
         Returns:
-            List of binding entries from the retry queue.
-        """
-        queue = self._data.retry_queue.copy()
-        self._data.retry_queue.clear()
-        if queue:
-            LOGGER.debug("Cleared retry queue of %d entries", len(queue))
-            await self.async_save()
-        return queue
+            A unique group ID not currently in use.
 
-    # ACL Management Methods
+        Raises:
+            RuntimeError: If no group IDs are available.
+        """
+        used_ids = {
+            self._data.group_resources[key]["group_id"]
+            for key in self._data.group_resources
+        }
+        for gid in range(AUTOBIND_GROUP_ID_START, AUTOBIND_GROUP_ID_MAX + 1):
+            if gid not in used_ids:
+                return gid
+        raise RuntimeError("No available group IDs")
+
+    def get_existing_group_id(self, automation_id: str) -> int | None:
+        """Get the group ID used by an automation, if any."""
+        resources = self._data.automation_resources.get(automation_id)
+        if not resources or not resources["group_keys"]:
+            return None
+        # Return the first group ID (automations typically use one group)
+        first_key = resources["group_keys"][0]
+        group_resource = self._data.group_resources.get(first_key)
+        return group_resource["group_id"] if group_resource else None
+
+    # =========================================================================
+    # ACL Resource Management (Reference Counted)
+    # =========================================================================
+
+    def get_acl_resource(self, key: str) -> AclResourceDict | None:
+        """Get an ACL resource by key."""
+        return self._data.acl_resources.get(key)
+
+    def acl_exists(self, key: str) -> bool:
+        """Check if an ACL resource exists."""
+        return key in self._data.acl_resources
+
+    def acquire_acl(
+        self,
+        automation_id: str,
+        target_node_id: int,
+        source_node_id: int,
+        endpoint_id: int = 0,
+    ) -> tuple[str, bool]:
+        """Acquire an ACL resource, incrementing ref count or creating new.
+
+        Args:
+            automation_id: The automation acquiring this resource.
+            target_node_id: Node where ACL will be created.
+            source_node_id: Node to grant access to.
+            endpoint_id: Endpoint (usually 0).
+
+        Returns:
+            Tuple of (key, is_new) where is_new indicates if resource was created.
+        """
+        key = acl_key(target_node_id, source_node_id, endpoint_id)
+        is_new = False
+
+        if key in self._data.acl_resources:
+            # Increment ref count
+            self._data.acl_resources[key]["ref_count"] += 1
+            if automation_id not in self._data.acl_resources[key]["automation_ids"]:
+                self._data.acl_resources[key]["automation_ids"].append(automation_id)
+            LOGGER.debug(
+                "ACL %s ref_count incremented to %d",
+                key,
+                self._data.acl_resources[key]["ref_count"],
+            )
+        else:
+            # Create new resource entry
+            self._data.acl_resources[key] = AclResourceDict(
+                target_node_id=target_node_id,
+                source_node_id=source_node_id,
+                endpoint_id=endpoint_id,
+                ref_count=1,
+                automation_ids=[automation_id],
+            )
+            is_new = True
+            LOGGER.debug("ACL %s created with ref_count=1", key)
+
+        # Track in automation resources
+        self._ensure_automation_resources(automation_id)
+        if key not in self._data.automation_resources[automation_id]["acl_keys"]:
+            self._data.automation_resources[automation_id]["acl_keys"].append(key)
+
+        return key, is_new
+
+    def release_acl(self, automation_id: str, key: str) -> bool:
+        """Release an ACL resource, decrementing ref count.
+
+        Args:
+            automation_id: The automation releasing this resource.
+            key: The ACL resource key.
+
+        Returns:
+            True if resource should be removed from device (ref_count reached 0).
+        """
+        if key not in self._data.acl_resources:
+            return False
+
+        resource = self._data.acl_resources[key]
+        resource["ref_count"] -= 1
+        if automation_id in resource["automation_ids"]:
+            resource["automation_ids"].remove(automation_id)
+
+        # Remove from automation's resource list
+        if automation_id in self._data.automation_resources:
+            acl_keys = self._data.automation_resources[automation_id]["acl_keys"]
+            if key in acl_keys:
+                acl_keys.remove(key)
+
+        should_remove = resource["ref_count"] <= 0
+        if should_remove:
+            del self._data.acl_resources[key]
+            LOGGER.debug("ACL %s removed (ref_count=0)", key)
+        else:
+            LOGGER.debug(
+                "ACL %s ref_count decremented to %d", key, resource["ref_count"]
+            )
+
+        return should_remove
+
+    # =========================================================================
+    # Binding Resource Management (Reference Counted)
+    # =========================================================================
+
+    def get_binding_resource(self, key: str) -> BindingResourceDict | None:
+        """Get a binding resource by key."""
+        return self._data.binding_resources.get(key)
+
+    def binding_exists(self, key: str) -> bool:
+        """Check if a binding resource exists."""
+        return key in self._data.binding_resources
+
+    def acquire_binding(
+        self,
+        automation_id: str,
+        source_node_id: int,
+        source_endpoint: int,
+        target: int | str,  # node_id or "gXXXXX"
+        target_endpoint: int,
+        cluster_ids: list[int] | None = None,
+    ) -> tuple[str, bool]:
+        """Acquire a binding resource, incrementing ref count or creating new.
+
+        Args:
+            automation_id: The automation acquiring this resource.
+            source_node_id: Node where binding will be written.
+            source_endpoint: Endpoint with binding cluster.
+            target: Target node ID (int) or group reference ("gXXXXX").
+            target_endpoint: Target endpoint.
+            cluster_ids: Optional list of cluster IDs to bind.
+
+        Returns:
+            Tuple of (key, is_new) where is_new indicates if resource was created.
+        """
+        key = binding_key(source_node_id, source_endpoint, target, target_endpoint)
+        is_new = False
+
+        if key in self._data.binding_resources:
+            # Increment ref count
+            self._data.binding_resources[key]["ref_count"] += 1
+            if automation_id not in self._data.binding_resources[key]["automation_ids"]:
+                self._data.binding_resources[key]["automation_ids"].append(
+                    automation_id
+                )
+            LOGGER.debug(
+                "Binding %s ref_count incremented to %d",
+                key,
+                self._data.binding_resources[key]["ref_count"],
+            )
+        else:
+            # Parse target
+            target_node_id, target_group_id = parse_binding_target(target)
+
+            # Create new resource entry
+            self._data.binding_resources[key] = BindingResourceDict(
+                source_node_id=source_node_id,
+                source_endpoint=source_endpoint,
+                target_node_id=target_node_id,
+                target_group_id=target_group_id,
+                target_endpoint=target_endpoint,
+                cluster_ids=cluster_ids or [],
+                ref_count=1,
+                automation_ids=[automation_id],
+            )
+            is_new = True
+            LOGGER.debug("Binding %s created with ref_count=1", key)
+
+        # Track in automation resources
+        self._ensure_automation_resources(automation_id)
+        if key not in self._data.automation_resources[automation_id]["binding_keys"]:
+            self._data.automation_resources[automation_id]["binding_keys"].append(key)
+
+        return key, is_new
+
+    def release_binding(self, automation_id: str, key: str) -> bool:
+        """Release a binding resource, decrementing ref count.
+
+        Args:
+            automation_id: The automation releasing this resource.
+            key: The binding resource key.
+
+        Returns:
+            True if resource should be removed from device (ref_count reached 0).
+        """
+        if key not in self._data.binding_resources:
+            return False
+
+        resource = self._data.binding_resources[key]
+        resource["ref_count"] -= 1
+        if automation_id in resource["automation_ids"]:
+            resource["automation_ids"].remove(automation_id)
+
+        # Remove from automation's resource list
+        if automation_id in self._data.automation_resources:
+            binding_keys = self._data.automation_resources[automation_id][
+                "binding_keys"
+            ]
+            if key in binding_keys:
+                binding_keys.remove(key)
+
+        should_remove = resource["ref_count"] <= 0
+        if should_remove:
+            del self._data.binding_resources[key]
+            LOGGER.debug("Binding %s removed (ref_count=0)", key)
+        else:
+            LOGGER.debug(
+                "Binding %s ref_count decremented to %d", key, resource["ref_count"]
+            )
+
+        return should_remove
+
+    # =========================================================================
+    # Group Resource Management (Reference Counted)
+    # =========================================================================
+
+    def get_group_resource(self, key: str) -> GroupResourceDict | None:
+        """Get a group resource by key."""
+        return self._data.group_resources.get(key)
+
+    def group_exists(self, key: str) -> bool:
+        """Check if a group resource exists."""
+        return key in self._data.group_resources
+
+    def acquire_group(
+        self,
+        automation_id: str,
+        group_id: int,
+        group_name: str,
+        members: list[tuple[int, int]],  # list of (node_id, endpoint_id)
+        epoch_key: str | None = None,
+        key_set_index: int | None = None,
+    ) -> tuple[str, bool]:
+        """Acquire a group resource, incrementing ref count or creating new.
+
+        Args:
+            automation_id: The automation acquiring this resource.
+            group_id: The Matter group ID.
+            group_name: Name for the group.
+            members: Target members list of (node_id, endpoint_id) tuples.
+            epoch_key: Hex-encoded 16-byte epoch key (for new groups).
+            key_set_index: Key set index 1-3 (for new groups).
+
+        Returns:
+            Tuple of (key, is_new) where is_new indicates if resource was created.
+        """
+        key = group_key(group_id)
+        is_new = False
+
+        if key in self._data.group_resources:
+            # Increment ref count
+            self._data.group_resources[key]["ref_count"] += 1
+            if automation_id not in self._data.group_resources[key]["automation_ids"]:
+                self._data.group_resources[key]["automation_ids"].append(automation_id)
+            LOGGER.debug(
+                "Group %s ref_count incremented to %d",
+                key,
+                self._data.group_resources[key]["ref_count"],
+            )
+        else:
+            # Create new resource entry with epoch key for future reuse
+            self._data.group_resources[key] = GroupResourceDict(
+                group_id=group_id,
+                group_name=group_name,
+                members=[
+                    GroupMemberDict(node_id=nid, endpoint_id=eid)
+                    for nid, eid in members
+                ],
+                source_nodes=[],  # Sources are tracked separately
+                epoch_key=epoch_key,
+                key_set_index=key_set_index,
+                ref_count=1,
+                automation_ids=[automation_id],
+            )
+            is_new = True
+            LOGGER.debug(
+                "Group %s created with ref_count=1, epoch_key=%s",
+                key,
+                epoch_key[:8] + "..." if epoch_key else None,
+            )
+
+        # Track in automation resources
+        self._ensure_automation_resources(automation_id)
+        if key not in self._data.automation_resources[automation_id]["group_keys"]:
+            self._data.automation_resources[automation_id]["group_keys"].append(key)
+
+        return key, is_new
+
+    def update_group_epoch_key(
+        self,
+        key: str,
+        epoch_key: str,
+        key_set_index: int,
+    ) -> None:
+        """Update the epoch key for a group (after creation on devices).
+
+        Args:
+            key: The group resource key.
+            epoch_key: Hex-encoded 16-byte epoch key.
+            key_set_index: Key set index (1-3).
+        """
+        if key not in self._data.group_resources:
+            return
+
+        self._data.group_resources[key]["epoch_key"] = epoch_key
+        self._data.group_resources[key]["key_set_index"] = key_set_index
+        LOGGER.debug(
+            "Group %s epoch_key updated (key=%s...)",
+            key,
+            epoch_key[:8] if epoch_key else None,
+        )
+
+    def update_group_source_nodes(
+        self,
+        key: str,
+        source_nodes: list[int],
+    ) -> None:
+        """Update the source nodes that have GroupKeyMap for this group.
+
+        Args:
+            key: The group resource key.
+            source_nodes: List of source node IDs with GroupKeyMap.
+        """
+        if key not in self._data.group_resources:
+            return
+
+        self._data.group_resources[key]["source_nodes"] = source_nodes
+        LOGGER.debug(
+            "Group %s source_nodes updated to %s",
+            key,
+            source_nodes,
+        )
+
+    def release_group(self, automation_id: str, key: str) -> bool:
+        """Release a group resource, decrementing ref count.
+
+        Args:
+            automation_id: The automation releasing this resource.
+            key: The group resource key.
+
+        Returns:
+            True if resource should be removed from devices (ref_count reached 0).
+        """
+        if key not in self._data.group_resources:
+            return False
+
+        resource = self._data.group_resources[key]
+        resource["ref_count"] -= 1
+        if automation_id in resource["automation_ids"]:
+            resource["automation_ids"].remove(automation_id)
+
+        # Remove from automation's resource list
+        if automation_id in self._data.automation_resources:
+            group_keys = self._data.automation_resources[automation_id]["group_keys"]
+            if key in group_keys:
+                group_keys.remove(key)
+
+        should_remove = resource["ref_count"] <= 0
+        if should_remove:
+            del self._data.group_resources[key]
+            LOGGER.debug("Group %s removed (ref_count=0)", key)
+        else:
+            LOGGER.debug(
+                "Group %s ref_count decremented to %d", key, resource["ref_count"]
+            )
+
+        return should_remove
+
+    def update_group_members(
+        self,
+        key: str,
+        members: list[tuple[int, int]],
+    ) -> None:
+        """Update the members of a group resource.
+
+        Args:
+            key: The group resource key.
+            members: New list of (node_id, endpoint_id) tuples.
+        """
+        if key not in self._data.group_resources:
+            return
+
+        self._data.group_resources[key]["members"] = [
+            GroupMemberDict(node_id=nid, endpoint_id=eid) for nid, eid in members
+        ]
+        LOGGER.debug("Group %s members updated to %d members", key, len(members))
+
+    # =========================================================================
+    # Legacy Methods (Backwards Compatibility with existing manager.py)
+    # =========================================================================
 
     async def async_add_acl(self, automation_id: str, acl_entry: AclEntryDict) -> None:
-        """Add an ACL entry for an automation.
+        """Add an ACL entry for an automation (legacy compatibility).
 
-        Args:
-            automation_id: The entity_id of the automation.
-            acl_entry: The ACL entry details.
+        This adapts the old API to use the new reference-counted storage.
         """
-        if automation_id not in self._data.managed_acls:
-            self._data.managed_acls[automation_id] = []
-        self._data.managed_acls[automation_id].append(acl_entry)
-        LOGGER.debug(
-            "Added ACL for automation %s: source=%d -> target=%d",
+        self.acquire_acl(
             automation_id,
-            acl_entry["source_node_id"],
             acl_entry["target_node_id"],
+            acl_entry["source_node_id"],
+            acl_entry["endpoint_id"],
         )
         await self.async_save()
 
-    def get_acls_for_automation(self, automation_id: str) -> list[AclEntryDict]:
-        """Get all ACL entries for an automation.
+    async def async_add_binding(
+        self, automation_id: str, binding_entry: BindingEntryDict
+    ) -> None:
+        """Add a binding for an automation (legacy compatibility).
 
-        Args:
-            automation_id: The entity_id of the automation.
-
-        Returns:
-            List of ACL entries for the automation.
+        This adapts the old API to use the new reference-counted storage.
         """
-        return self._data.managed_acls.get(automation_id, [])
+        self.acquire_binding(
+            automation_id,
+            binding_entry["client_node_id"],
+            binding_entry["client_endpoint"],
+            binding_entry["target_node_id"],
+            binding_entry["target_endpoint"],
+        )
+        await self.async_save()
 
     async def async_remove_acls_for_automation(
         self, automation_id: str
     ) -> list[AclEntryDict]:
-        """Remove all ACL entries for an automation.
+        """Remove all ACL entries for an automation (legacy compatibility).
 
-        Args:
-            automation_id: The entity_id of the automation.
-
-        Returns:
-            List of removed ACL entries.
+        Returns the list of removed entries for device cleanup.
         """
-        acls = self._data.managed_acls.pop(automation_id, [])
-        if acls:
-            LOGGER.debug(
-                "Removed %d ACL entries for automation %s", len(acls), automation_id
-            )
-            await self.async_save()
-        return acls
+        removed: list[AclEntryDict] = []
+
+        if automation_id not in self._data.automation_resources:
+            return removed
+
+        acl_keys = list(self._data.automation_resources[automation_id]["acl_keys"])
+        for key in acl_keys:
+            acl = self.get_acl_resource(key)
+            if acl:
+                removed.append(
+                    AclEntryDict(
+                        target_node_id=acl["target_node_id"],
+                        source_node_id=acl["source_node_id"],
+                        endpoint_id=acl["endpoint_id"],
+                        acl_index=None,
+                    )
+                )
+            self.release_acl(automation_id, key)
+
+        await self.async_save()
+        return removed
+
+    async def async_remove_bindings_for_automation(
+        self, automation_id: str
+    ) -> list[BindingEntryDict]:
+        """Remove all bindings for an automation (legacy compatibility).
+
+        Returns the list of removed bindings for device cleanup.
+        """
+        removed: list[BindingEntryDict] = []
+
+        if automation_id not in self._data.automation_resources:
+            return removed
+
+        binding_keys = list(
+            self._data.automation_resources[automation_id]["binding_keys"]
+        )
+        for key in binding_keys:
+            binding = self.get_binding_resource(key)
+            if binding and binding["target_node_id"] is not None:
+                removed.append(
+                    BindingEntryDict(
+                        client_node_id=binding["source_node_id"],
+                        client_endpoint=binding["source_endpoint"],
+                        target_node_id=binding["target_node_id"],
+                        target_endpoint=binding["target_endpoint"],
+                        clusters=[],
+                    )
+                )
+            self.release_binding(automation_id, key)
+
+        await self.async_save()
+        return removed
