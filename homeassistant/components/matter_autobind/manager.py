@@ -37,6 +37,7 @@ from homeassistant.helpers.event import (
 from .const import (
     CLUSTER_ID_BINDING,
     CLUSTER_ID_ON_OFF,
+    CONF_ENABLE_GROUP_BINDINGS,
     DEBUG_OVERWRITE_ACLS,
     DOMAIN as AUTOBIND_DOMAIN,
     LOGGER,
@@ -2297,25 +2298,41 @@ class MatterBindingManager:
         groups: set[tuple[int, frozenset[tuple[int, int]]]] = set()
         group_id: int | None = None
 
-        # Bindings: Depends on target count
-        if len(action_nodes) == 1:
-            # Single target: unicast bindings
-            # ACLs use source_node_id as subject with authMode=2 (CASE)
-            target = action_nodes[0]
-            for source in trigger_nodes:
-                # ACL tuple: (target_node_id, subject, auth_mode)
-                # authMode 2 = CASE (node-to-node)
-                acls.add((target.node_id, source.node_id, 2))
-                bindings.add(
-                    (
-                        source.node_id,
-                        source.endpoint_id,
-                        target.node_id,  # Direct node reference (int)
-                        target.endpoint_id,
+        # Check if group bindings are enabled
+        enable_groups = self._config_entry.options.get(
+            CONF_ENABLE_GROUP_BINDINGS, False
+        )
+
+        # Decide binding strategy based on target count and group setting
+        use_groups = len(action_nodes) > 1 and enable_groups
+
+        if not use_groups:
+            # Unicast bindings: each source -> each target
+            # Used for single target OR when groups are disabled
+            for target in action_nodes:
+                for source in trigger_nodes:
+                    # ACL tuple: (target_node_id, subject, auth_mode)
+                    # authMode 2 = CASE (node-to-node)
+                    acls.add((target.node_id, source.node_id, 2))
+                    bindings.add(
+                        (
+                            source.node_id,
+                            source.endpoint_id,
+                            target.node_id,  # Direct node reference (int)
+                            target.endpoint_id,
+                        )
                     )
+
+            if len(action_nodes) > 1:
+                LOGGER.info(
+                    "Group bindings disabled - creating %d unicast bindings "
+                    "(%d sources × %d targets)",
+                    len(trigger_nodes) * len(action_nodes),
+                    len(trigger_nodes),
+                    len(action_nodes),
                 )
-        elif len(action_nodes) > 1:
-            # Multiple targets: group binding
+        else:
+            # Group bindings: sources -> group, targets in group
             group_id = existing_group_id or self._store.allocate_group_id()
 
             # Group membership

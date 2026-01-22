@@ -15,6 +15,9 @@ LOGGER = logging.getLogger(__package__)
 STORAGE_KEY: Final = f"{DOMAIN}.storage"
 STORAGE_VERSION: Final = 1
 
+# Configuration options
+CONF_ENABLE_GROUP_BINDINGS: Final = "enable_group_bindings"
+
 # Matter Cluster IDs
 # See: https://csa-iot.org/developer-resource/specifications-download-request/
 CLUSTER_ID_BINDING: Final = 0x001E  # Binding Cluster (Client devices)

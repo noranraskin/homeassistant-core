@@ -4,9 +4,17 @@ from __future__ import annotations
 
 from typing import Any
 
-from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
+import voluptuous as vol
 
-from .const import DOMAIN
+from homeassistant.config_entries import (
+    ConfigEntry,
+    ConfigFlow,
+    ConfigFlowResult,
+    OptionsFlow,
+)
+from homeassistant.core import callback
+
+from .const import CONF_ENABLE_GROUP_BINDINGS, DOMAIN
 
 
 class MatterAutoBindConfigFlow(ConfigFlow, domain=DOMAIN):
@@ -34,4 +42,40 @@ class MatterAutoBindConfigFlow(ConfigFlow, domain=DOMAIN):
         return self.async_create_entry(
             title="Matter AutoBind",
             data={},
+            options={CONF_ENABLE_GROUP_BINDINGS: False},  # Default to disabled
+        )
+
+    @staticmethod
+    @callback
+    def async_get_options_flow(config_entry: ConfigEntry) -> OptionsFlow:
+        """Get the options flow for this handler."""
+        return MatterAutoBindOptionsFlow(config_entry)
+
+
+class MatterAutoBindOptionsFlow(OptionsFlow):
+    """Handle Matter AutoBind options."""
+
+    def __init__(self, config_entry: ConfigEntry) -> None:
+        """Initialize options flow."""
+        self.config_entry = config_entry
+
+    async def async_step_init(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Manage the options."""
+        if user_input is not None:
+            return self.async_create_entry(title="", data=user_input)
+
+        return self.async_show_form(
+            step_id="init",
+            data_schema=vol.Schema(
+                {
+                    vol.Optional(
+                        CONF_ENABLE_GROUP_BINDINGS,
+                        default=self.config_entry.options.get(
+                            CONF_ENABLE_GROUP_BINDINGS, False
+                        ),
+                    ): bool,
+                }
+            ),
         )
