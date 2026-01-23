@@ -100,7 +100,7 @@ class GroupManager:
             return
 
         group_name = f"AutoBind-{group_id}"
-        key_set_index = (group_id % 3) + 1
+        key_set_index = (group_id % 16) + 1
 
         # Generate ONE shared key for all nodes
         epoch_key = secrets.token_bytes(16)
