@@ -10,11 +10,23 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any
 
-from homeassistant.components.matter.helpers import get_matter
+from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 
 if TYPE_CHECKING:
-    from homeassistant.core import HomeAssistant
+    from homeassistant.components.matter.helpers import (  # pylint: disable=hass-component-root-import
+        get_matter as _get_matter,
+    )
+else:
+    from homeassistant.components.matter.helpers import (  # pylint: disable=hass-component-root-import
+        get_matter as _get_matter,
+    )
+
+
+def get_matter(hass: HomeAssistant) -> Any:
+    """Wrapper for get_matter to satisfy type checking."""
+    return _get_matter(hass)
+
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -380,7 +392,7 @@ class MatterAdapter:
             # Create binding entry
             is_group = isinstance(target, str) and target.startswith("g")
             if is_group:
-                group_id = int(target[1:])
+                group_id = int(str(target)[1:])
                 new_binding = {"254": fabric_id, "2": group_id}
 
                 # Check if exists
@@ -449,7 +461,7 @@ class MatterAdapter:
 
         except (HomeAssistantError, OSError, ValueError) as err:
             self._logger.error("Failed to write binding: %s", err)
-            binding_verified = False
+            return False
         else:
             return binding_verified
 
@@ -526,7 +538,7 @@ class MatterAdapter:
                 current_bindings = []
 
             is_group = isinstance(target, str) and target.startswith("g")
-            target_value = int(target[1:]) if is_group else int(target)
+            target_value = int(str(target)[1:]) if is_group else int(target)
 
             # Check if binding exists
             for binding in current_bindings:
@@ -589,7 +601,7 @@ class MatterAdapter:
                 return True  # Nothing to remove
 
             is_group = isinstance(target, str) and target.startswith("g")
-            target_value = int(target[1:]) if is_group else int(target)
+            target_value = int(str(target)[1:]) if is_group else int(target)
 
             updated_bindings = []
             for binding in current_bindings:

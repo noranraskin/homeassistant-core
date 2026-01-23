@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from chip.clusters import Objects as Clusters
 from matter_server.client.models import device_types
@@ -36,32 +36,38 @@ from .automation import is_physical_state_change
 from .const import (
     CLUSTER_ID_BINDING,
     CLUSTER_ID_ON_OFF,
-    CONF_ENABLE_GROUP_BINDINGS,
     DEBUG_OVERWRITE_ACLS,
-    DOMAIN as AUTOBIND_DOMAIN,
+    DOMAIN,
     LOGGER,
 )
-from .logic import GroupManager
+from .logic import GroupManager, NodeInfo, ResourceReconciler
 from .matter import MatterAdapter
-from .store import (
-    AclEntryDict,
-    BindingEntryDict,
-    EligibilityStatus,
-    MatterBindingStore,
-    acl_key,
-    binding_key,
-    group_key,
-)
+from .store import AclEntryDict, BindingEntryDict, EligibilityStatus, MatterBindingStore
 
 if TYPE_CHECKING:
+    from homeassistant.components.matter.helpers import (  # pylint: disable=hass-component-root-import
+        get_matter as _get_matter,
+        get_node_from_device_entry as _get_node_from_device_entry,
+    )
     from homeassistant.config_entries import ConfigEntry
-
-from homeassistant.components.matter.helpers import (
-    get_matter,
-    get_node_from_device_entry,
-)
+else:
+    from homeassistant.components.matter.helpers import (  # pylint: disable=hass-component-root-import
+        get_matter as _get_matter,
+        get_node_from_device_entry as _get_node_from_device_entry,
+    )
 
 from .discovery import async_discover_client_cluster_entities
+
+
+def get_matter(hass: HomeAssistant) -> Any:
+    """Wrapper for get_matter."""
+    return _get_matter(hass)
+
+
+def get_node_from_device_entry(hass: HomeAssistant, device_entry: Any) -> Any:
+    """Wrapper for get_node_from_device_entry."""
+    return _get_node_from_device_entry(hass, device_entry)
+
 
 # Matter domain constant
 MATTER_DOMAIN = "matter"
@@ -87,42 +93,6 @@ class StatefulSwitchInfo:
 
     client_clusters: list[int]
     """List of client cluster IDs available for binding."""
-
-
-@dataclass
-class NodeInfo:
-    """Information about a Matter node derived from an entity."""
-
-    entity_id: str
-    """The entity_id."""
-
-    node_id: int
-    """The Matter node ID."""
-
-    endpoint_id: int
-    """The endpoint ID (typically 1 for most devices)."""
-
-
-@dataclass
-class DesiredResourceState:
-    """Represents the desired resource state for an automation.
-
-    This is computed from the automation's trigger and action entities,
-    then compared against the current state to determine what operations
-    are needed to reconcile.
-    """
-
-    # Set of (target_node_id, source_node_id, endpoint_id) tuples
-    acls: set[tuple[int, int, int]]
-
-    # Set of (source_node, source_ep, target (int or "gXXXX"), target_ep) tuples
-    bindings: set[tuple[int, int, int | str, int]]
-
-    # Set of (group_id, frozenset of (node_id, endpoint_id)) tuples
-    groups: set[tuple[int, frozenset[tuple[int, int]]]]
-
-    # The group ID to use if needed (None if single target)
-    group_id: int | None = None
 
 
 class MatterBindingManager:
@@ -175,6 +145,10 @@ class MatterBindingManager:
         )
         # Group manager for group operations
         self._group_manager = GroupManager(hass, store, LOGGER)
+        # Resource reconciler for state management
+        self._reconciler = ResourceReconciler(
+            hass, config_entry, store, self._adapter, self._group_manager, LOGGER
+        )
 
     @property
     def store(self) -> MatterBindingStore:
@@ -582,7 +556,7 @@ class MatterBindingManager:
         LOGGER.info("Cleaning up resources for deleted automation: %s", automation_id)
 
         # Release all resources with reference counting
-        await self._release_all_resources(automation_id)
+        await self._reconciler.release_all_resources(automation_id)
 
         # Also clear scanned status and eligibility result
         await self._store.async_clear_scanned_automation(automation_id)
@@ -604,7 +578,7 @@ class MatterBindingManager:
         LOGGER.info("Releasing resources for disabled automation: %s", automation_id)
 
         # Release all resources
-        await self._release_all_resources(automation_id)
+        await self._reconciler.release_all_resources(automation_id)
 
     async def _async_handle_automation_enabled(self, automation_id: str) -> None:
         """Handle an automation being re-enabled.
@@ -696,7 +670,7 @@ class MatterBindingManager:
         else:
             # If previously eligible, release resources
             if not is_new:
-                await self._release_all_resources(automation_id)
+                await self._reconciler.release_all_resources(automation_id)
 
             LOGGER.info(
                 "✗ INELIGIBLE: Automation %s (%s) is not eligible for Matter binding",
@@ -985,7 +959,7 @@ class MatterBindingManager:
         automation_id: str,
         trigger_entities: list[str],
         action_entities: list[str],
-    ) -> None:
+    ) -> None:  # pylint: disable=too-many-nested-blocks
         """Create bindings on trigger devices pointing to target devices.
 
         For each trigger device, creates bindings to ALL target devices.
@@ -1108,7 +1082,7 @@ class MatterBindingManager:
 
                 # Build new bindings list - add bindings to all target devices
                 new_bindings = list(current_bindings)
-                endpoint_id = int(binding_path.split("/")[0])
+                endpoint_id = int(binding_path.split("/", 1)[0])
 
                 for target_node_id in action_node_ids:
                     # Check if binding already exists
@@ -1336,53 +1310,16 @@ class MatterBindingManager:
                 continue
 
             # Find Matter node ID from device identifiers
-            for domain, identifier in device.identifiers:
-                if domain == MATTER_DOMAIN:
-                    # Matter device identifiers can be in different formats:
-                    # 1. Simple node ID (integer)
-                    # 2. "deviceid_FABRIC-NODEID-MatterNodeDevice" format
-                    # 3. "serial_XXXXX" format (not useful for node ID)
+            # Find Matter node ID from device identifiers
+            node_id = self._get_node_id_from_device(device)
 
-                    node_id: int | None = None
-
-                    # Try to parse as simple integer first
-                    with contextlib.suppress(ValueError):
-                        node_id = int(identifier)
-
-                    # Try to parse "deviceid_FABRIC-NODEID-MatterNodeDevice" format
-                    if node_id is None and identifier.startswith("deviceid_"):
-                        try:
-                            # Format: deviceid_FABRIC-NODEID-MatterNodeDevice
-                            # Example: deviceid_7AF1B06B5DA7FC6B-0000000000000004-MatterNodeDevice
-                            parts = identifier.split("-")
-                            if len(parts) >= 2:
-                                # The second part is the node ID as a hex string
-                                node_id_hex = parts[1]
-                                node_id = int(node_id_hex, 16)
-                                LOGGER.debug(
-                                    "Parsed node ID %d from deviceid identifier: %s",
-                                    node_id,
-                                    identifier,
-                                )
-                        except (ValueError, IndexError) as parse_err:
-                            LOGGER.debug(
-                                "Could not parse deviceid format: %s - %s",
-                                identifier,
-                                parse_err,
-                            )
-
-                    if node_id is not None and node_id not in node_ids:
-                        node_ids.append(node_id)
-                        LOGGER.debug(
-                            "Found node ID %d for entity %s",
-                            node_id,
-                            entity_id,
-                        )
-                    elif node_id is None:
-                        LOGGER.debug(
-                            "Could not extract node ID from identifier: %s",
-                            identifier,
-                        )
+            if node_id is not None and node_id not in node_ids:
+                node_ids.append(node_id)
+                LOGGER.debug(
+                    "Found node ID %d for entity %s",
+                    node_id,
+                    entity_id,
+                )
 
         return node_ids
 
@@ -1459,6 +1396,59 @@ class MatterBindingManager:
         LOGGER.info("=" * 60)
         return results
 
+    def _extract_automation_config_entities(
+        self, automation_entity: Any
+    ) -> tuple[list[str], list[str], list[str], list[str]]:
+        """Extract referenced entities/devices from automation configuration.
+
+        Returns:
+            Tuple of (action_entities, action_devices, trigger_entities, trigger_devices)
+        """
+        action_referenced_entities: list[str] = []
+        action_referenced_devices: list[str] = []
+        trigger_referenced_entities: list[str] = []
+        trigger_referenced_devices: list[str] = []
+
+        # Get action entities/devices from action_script
+        # Use getattr to avoid type errors (base class doesn't define it)
+        try:
+            action_script = getattr(automation_entity, "action_script", None)
+            if action_script:
+                action_referenced_entities = list(action_script.referenced_entities)
+                action_referenced_devices = list(action_script.referenced_devices)
+        except AttributeError:
+            pass
+
+        # Get trigger entities from trigger config
+        if hasattr(automation_entity, "_trigger_config"):
+            for trigger_conf in automation_entity._trigger_config:  # noqa: SLF001
+                platform = trigger_conf.get(CONF_PLATFORM)
+                if platform in ("state", "numeric_state"):
+                    entity_ids = trigger_conf.get(CONF_ENTITY_ID, [])
+                    if isinstance(entity_ids, str):
+                        entity_ids = [entity_ids]
+                    trigger_referenced_entities.extend(entity_ids)
+                elif platform == "device":
+                    device_id = trigger_conf.get(CONF_DEVICE_ID)
+                    if device_id:
+                        if isinstance(device_id, list):
+                            trigger_referenced_devices.extend(device_id)
+                        else:
+                            trigger_referenced_devices.append(device_id)
+                    entity_id = trigger_conf.get(CONF_ENTITY_ID)
+                    if entity_id:
+                        if isinstance(entity_id, list):
+                            trigger_referenced_entities.extend(entity_id)
+                        else:
+                            trigger_referenced_entities.append(entity_id)
+
+        return (
+            action_referenced_entities,
+            action_referenced_devices,
+            trigger_referenced_entities,
+            trigger_referenced_devices,
+        )
+
     async def check_automation_eligibility(
         self, automation_id: str
     ) -> tuple[bool, EligibilityStatus, list[str], list[str], str]:
@@ -1511,44 +1501,13 @@ class MatterBindingManager:
                 f"Could not access automation entity {automation_id}",
             )
 
-        # Get action entities from action_script
-        # These are the entities that the automation ACTS ON (targets)
-        action_referenced_entities = list(
-            automation_entity.action_script.referenced_entities
-        )
-        action_referenced_devices = list(
-            automation_entity.action_script.referenced_devices
-        )
-
-        # Get trigger entities from trigger config
-        # These are the entities that TRIGGER the automation (sources)
-        trigger_referenced_entities: list[str] = []
-        trigger_referenced_devices: list[str] = []
-
-        # Check if automation has _trigger_config (AutomationEntity has it, UnavailableAutomationEntity doesn't)
-        if hasattr(automation_entity, "_trigger_config"):
-            for trigger_conf in automation_entity._trigger_config:
-                # Extract entities from trigger
-                platform = trigger_conf.get(CONF_PLATFORM)
-                if platform in ("state", "numeric_state"):
-                    entity_ids = trigger_conf.get(CONF_ENTITY_ID, [])
-                    if isinstance(entity_ids, str):
-                        entity_ids = [entity_ids]
-                    trigger_referenced_entities.extend(entity_ids)
-                elif platform == "device":
-                    device_id = trigger_conf.get(CONF_DEVICE_ID)
-                    if device_id:
-                        if isinstance(device_id, list):
-                            trigger_referenced_devices.extend(device_id)
-                        else:
-                            trigger_referenced_devices.append(device_id)
-                    # Also check for entity_id in device triggers
-                    entity_id = trigger_conf.get(CONF_ENTITY_ID)
-                    if entity_id:
-                        if isinstance(entity_id, list):
-                            trigger_referenced_entities.extend(entity_id)
-                        else:
-                            trigger_referenced_entities.append(entity_id)
+        # Extract entities using helper to reduce complexity
+        (
+            action_referenced_entities,
+            action_referenced_devices,
+            trigger_referenced_entities,
+            trigger_referenced_devices,
+        ) = self._extract_automation_config_entities(automation_entity)
 
         LOGGER.debug("Action entities: %s", action_referenced_entities)
         LOGGER.debug("Action devices: %s", action_referenced_devices)
@@ -1906,7 +1865,7 @@ class MatterBindingManager:
 
         # Accept entities from both the official matter integration
         # and our matter_autobind integration (for client cluster entities)
-        return entity_entry.platform in (MATTER_DOMAIN, AUTOBIND_DOMAIN)
+        return entity_entry.platform in (MATTER_DOMAIN, DOMAIN)
 
     @callback
     def _get_matter_entities_for_device(self, device_id: str) -> list[str]:
@@ -1929,7 +1888,7 @@ class MatterBindingManager:
             for entity in er.async_entries_for_device(
                 self._entity_registry, device_id, include_disabled_entities=False
             )
-            if entity.platform in (MATTER_DOMAIN, AUTOBIND_DOMAIN)
+            if entity.platform in (MATTER_DOMAIN, DOMAIN)
         ]
 
     async def async_create_binding(
@@ -1966,7 +1925,6 @@ class MatterBindingManager:
             clusters,
         )
 
-        # TODO: Implement actual binding logic in future phase
         # 1. Check client has Binding Cluster (CLUSTER_ID_BINDING)
         # 2. Check client has open slot in Binding Table
         # 3. Write ACL entry to target device
@@ -1997,7 +1955,6 @@ class MatterBindingManager:
         Returns:
             True if the node has the Binding cluster.
         """
-        # TODO: Query Matter server for node clusters
         _ = CLUSTER_ID_BINDING  # Reference to avoid unused import
         LOGGER.debug("Checking binding cluster support for node %d (stub)", node_id)
         return False
@@ -2016,6 +1973,10 @@ class MatterBindingManager:
             LOGGER.warning(
                 "Matter integration not loaded, skipping client cluster discovery"
             )
+            return
+
+        if self._entity_registry is None:
+            LOGGER.warning("Entity registry not available")
             return
 
         # Get the matter adapter
@@ -2093,6 +2054,10 @@ class MatterBindingManager:
             node: The MatterNode to discover entities for.
         """
         LOGGER.info("Discovering client cluster entities for node %d", node.node_id)
+
+        if self._entity_registry is None:
+            LOGGER.warning("Entity registry not available")
+            return
 
         # Get the matter adapter
         try:
@@ -2205,24 +2170,7 @@ class MatterBindingManager:
                 continue
 
             # Find Matter node ID from device identifiers
-            node_id: int | None = None
-            for domain, identifier in device.identifiers:
-                if domain == MATTER_DOMAIN:
-                    # Try to parse as simple integer first
-                    with contextlib.suppress(ValueError):
-                        node_id = int(identifier)
-
-                    # Try to parse "deviceid_FABRIC-NODEID-MatterNodeDevice" format
-                    if node_id is None and identifier.startswith("deviceid_"):
-                        try:
-                            parts = identifier.split("-")
-                            if len(parts) >= 2:
-                                node_id = int(parts[1], 16)
-                        except (ValueError, IndexError):
-                            pass
-
-                    if node_id is not None:
-                        break
+            node_id = self._get_node_id_from_device(device)
 
             if node_id is not None:
                 # Default to endpoint 1 for most devices
@@ -2236,153 +2184,30 @@ class MatterBindingManager:
 
         return result
 
-    def _compute_desired_state(
-        self,
-        trigger_nodes: list[NodeInfo],
-        action_nodes: list[NodeInfo],
-        existing_group_id: int | None = None,
-    ) -> DesiredResourceState:
-        """Compute what resources SHOULD exist for this automation.
+    def _get_node_id_from_device(self, device: dr.DeviceEntry) -> int | None:
+        """Extract Matter node ID from device identifiers."""
+        node_id: int | None = None
+        for domain, identifier in device.identifiers:
+            if domain == MATTER_DOMAIN:
+                # Try to parse as simple integer first
+                if identifier.isdigit():
+                    return int(identifier)
 
-        Args:
-            trigger_nodes: List of trigger node info.
-            action_nodes: List of action node info.
-            existing_group_id: Reuse existing group ID if available.
+                with contextlib.suppress(ValueError):
+                    node_id = int(identifier)
 
-        Returns:
-            DesiredResourceState with all required resources.
-        """
-        acls: set[tuple[int, int, int]] = set()
-        bindings: set[tuple[int, int, int | str, int]] = set()
-        groups: set[tuple[int, frozenset[tuple[int, int]]]] = set()
-        group_id: int | None = None
+                # Try to parse "deviceid_FABRIC-NODEID-MatterNodeDevice" format
+                if node_id is None and identifier.startswith("deviceid_"):
+                    try:
+                        parts = identifier.split("-")
+                        if len(parts) >= 2:
+                            node_id = int(parts[1], 16)
+                    except (ValueError, IndexError):
+                        pass
 
-        # Check if group bindings are enabled
-        enable_groups = self._config_entry.options.get(
-            CONF_ENABLE_GROUP_BINDINGS, False
-        )
-
-        # Decide binding strategy based on target count and group setting
-        use_groups = len(action_nodes) > 1 and enable_groups
-
-        if not use_groups:
-            # Unicast bindings: each source -> each target
-            # Used for single target OR when groups are disabled
-            for target in action_nodes:
-                for source in trigger_nodes:
-                    # ACL tuple: (target_node_id, subject, auth_mode)
-                    # authMode 2 = CASE (node-to-node)
-                    acls.add((target.node_id, source.node_id, 2))
-                    bindings.add(
-                        (
-                            source.node_id,
-                            source.endpoint_id,
-                            target.node_id,  # Direct node reference (int)
-                            target.endpoint_id,
-                        )
-                    )
-
-            if len(action_nodes) > 1:
-                LOGGER.info(
-                    "Group bindings disabled - creating %d unicast bindings "
-                    "(%d sources × %d targets)",
-                    len(trigger_nodes) * len(action_nodes),
-                    len(trigger_nodes),
-                    len(action_nodes),
-                )
-        else:
-            # Group bindings: sources -> group, targets in group
-            group_id = existing_group_id or self._store.allocate_group_id()
-
-            # Group membership
-            members = frozenset((n.node_id, n.endpoint_id) for n in action_nodes)
-            groups.add((group_id, members))
-
-            # ACLs: Each target needs BOTH:
-            # 1. GROUP ACL (authMode=3) for receiving group multicast messages
-            # 2. CASE ACLs (authMode=2) for each source (for unicast fallback/setup)
-            for target in action_nodes:
-                # GROUP ACL for group messages
-                acls.add((target.node_id, group_id, 3))
-                # CASE ACLs for each source node
-                for source in trigger_nodes:
-                    acls.add((target.node_id, source.node_id, 2))
-
-            # Group bindings for each trigger (source -> group)
-            for source in trigger_nodes:
-                bindings.add(
-                    (
-                        source.node_id,
-                        source.endpoint_id,
-                        f"g{group_id}",  # Group reference (string)
-                        0,  # Endpoint not used for group bindings
-                    )
-                )
-
-        return DesiredResourceState(
-            acls=acls,
-            bindings=bindings,
-            groups=groups,
-            group_id=group_id,
-        )
-
-    def _get_current_resource_state(self, automation_id: str) -> DesiredResourceState:
-        """Get current resource state for an automation from the store.
-
-        Args:
-            automation_id: The automation to get state for.
-
-        Returns:
-            DesiredResourceState representing current resources.
-        """
-        acls: set[tuple[int, int, int]] = set()
-        bindings: set[tuple[int, int, int | str, int]] = set()
-        groups: set[tuple[int, frozenset[tuple[int, int]]]] = set()
-
-        resources = self._store.get_automation_resources(automation_id)
-        if resources is None:
-            return DesiredResourceState(acls=acls, bindings=bindings, groups=groups)
-
-        # Extract ACLs
-        for key in resources["acl_keys"]:
-            acl = self._store.get_acl_resource(key)
-            if acl:
-                acls.add(
-                    (
-                        acl["target_node_id"],
-                        acl["source_node_id"],
-                        acl["endpoint_id"],
-                    )
-                )
-
-        # Extract bindings
-        for key in resources["binding_keys"]:
-            binding = self._store.get_binding_resource(key)
-            if binding:
-                target: int | str
-                if binding["target_group_id"] is not None:
-                    target = f"g{binding['target_group_id']}"
-                else:
-                    target = binding["target_node_id"] or 0
-                bindings.add(
-                    (
-                        binding["source_node_id"],
-                        binding["source_endpoint"],
-                        target,
-                        binding["target_endpoint"],
-                    )
-                )
-
-        # Extract groups
-        for key in resources["group_keys"]:
-            group = self._store.get_group_resource(key)
-            if group:
-                members = frozenset(
-                    (m["node_id"], m["endpoint_id"]) for m in group["members"]
-                )
-                groups.add((group["group_id"], members))
-
-        return DesiredResourceState(acls=acls, bindings=bindings, groups=groups)
+                if node_id is not None:
+                    return node_id
+        return None
 
     async def _reconcile_automation_resources(
         self,
@@ -2415,11 +2240,11 @@ class MatterBindingManager:
             return
 
         # Get current state
-        current = self._get_current_resource_state(automation_id)
+        current = self._reconciler.get_current_resource_state(automation_id)
 
         # Compute desired state
         existing_group_id = self._store.get_existing_group_id(automation_id)
-        desired = self._compute_desired_state(
+        desired = self._reconciler.compute_desired_state(
             trigger_nodes, action_nodes, existing_group_id
         )
 
@@ -2432,282 +2257,82 @@ class MatterBindingManager:
 
         # --- Reconcile Groups First (create before bindings need them) ---
         # Pass source nodes so they get the group key for encryption
-        await self._reconcile_groups(
+        await self._reconciler.reconcile_groups(
             automation_id, current.groups, desired.groups, trigger_nodes
         )
 
         # --- Reconcile ACLs ---
-        await self._reconcile_acls(automation_id, current.acls, desired.acls)
+        await self._reconciler.reconcile_acls(automation_id, current.acls, desired.acls)
 
         # --- Reconcile Bindings ---
-        await self._reconcile_bindings(
+        await self._reconciler.reconcile_bindings(
             automation_id, current.bindings, desired.bindings
         )
 
         await self._store.async_save()
         LOGGER.info("Reconciliation complete for automation %s", automation_id)
 
-    async def _reconcile_acls(
-        self,
-        automation_id: str,
-        current: set[tuple[int, int, int]],
-        desired: set[tuple[int, int, int]],
-    ) -> None:
-        """Reconcile ACL resources.
+    async def _read_node_bindings(
+        self, matter_client: Any, node_id: int
+    ) -> tuple[list[dict], str] | None:
+        """Read bindings from a node, trying endpoint 1 then 0.
 
-        ACL tuple format: (target_node_id, subject, auth_mode)
-        - For CASE auth (mode=2): subject is source_node_id
-        - For GROUP auth (mode=3): subject is group_id
+        Returns:
+            Tuple of (bindings, binding_path) or None on failure.
         """
-        to_add = desired - current
-        to_remove = current - desired
+        binding_path = "1/30/0"
+        binding_read_success = False
+        current_bindings: list[dict] = []
 
-        for target_node, subject, auth_mode in to_add:
-            key, is_new = self._store.acquire_acl(
-                automation_id, target_node, subject, auth_mode
+        try:
+            current_bindings_resp = await matter_client.read_attribute(
+                node_id, binding_path
             )
-            if is_new:
-                # Actually write ACL to device with correct auth_mode
-                await self._adapter.write_acl(target_node, subject, auth_mode)
-            LOGGER.debug(
-                "Acquired ACL %s (new=%s, auth_mode=%d)", key, is_new, auth_mode
-            )
+            raw_bindings = current_bindings_resp.get(binding_path, [])
 
-        for target_node, subject, auth_mode in to_remove:
-            key = acl_key(target_node, subject, auth_mode)
-            should_remove = self._store.release_acl(automation_id, key)
-            if should_remove:
-                # Actually remove ACL from device
-                await self._adapter.remove_acl(target_node, subject, auth_mode)
-            LOGGER.debug("Released ACL %s (removed=%s)", key, should_remove)
-
-    async def _reconcile_bindings(
-        self,
-        automation_id: str,
-        current: set[tuple[int, int, int | str, int]],
-        desired: set[tuple[int, int, int | str, int]],
-    ) -> None:
-        """Reconcile binding resources.
-
-        ALWAYS writes bindings to device regardless of store state to fix
-        store/device sync issues from previous failed writes.
-        """
-        to_add = desired - current
-        to_remove = current - desired
-
-        for source_node, source_ep, target, target_ep in to_add:
-            key, is_new = self._store.acquire_binding(
-                automation_id, source_node, source_ep, target, target_ep
-            )
-            # ALWAYS write to device and verify - don't trust is_new flag
-            # The store may think it exists but the device may not have it
-            LOGGER.info(
-                "Ensuring binding on device: node %d ep %d -> %s (store new=%s)",
-                source_node,
-                source_ep,
-                target,
-                is_new,
-            )
-            await self._adapter.write_binding(source_node, source_ep, target, target_ep)
-            LOGGER.debug("Acquired binding %s (new=%s)", key, is_new)
-
-        for source_node, source_ep, target, target_ep in to_remove:
-            key = binding_key(source_node, source_ep, target, target_ep)
-            should_remove = self._store.release_binding(automation_id, key)
-            if should_remove:
-                # Actually remove binding from device
-                await self._adapter.remove_binding(
-                    source_node, source_ep, target, target_ep
-                )
-            LOGGER.debug("Released binding %s (removed=%s)", key, should_remove)
-
-    async def _reconcile_groups(
-        self,
-        automation_id: str,
-        current: set[tuple[int, frozenset[tuple[int, int]]]],
-        desired: set[tuple[int, frozenset[tuple[int, int]]]],
-        source_nodes: list[NodeInfo] | None = None,
-    ) -> None:
-        """Reconcile group resources.
-
-        Handles:
-        - Creating new groups with sources and targets
-        - Adding/removing targets from existing groups
-        - Adding GroupKeyMap to new sources
-        - Removing GroupKeyMap from old sources
-        - Removing groups when targets drop below 2
-
-        Args:
-            automation_id: The automation ID.
-            current: Current group state (group_id, members frozenset).
-            desired: Desired group state (group_id, members frozenset).
-            source_nodes: Source nodes that need the group key for encryption.
-        """
-        current_by_id = dict(current)
-        desired_by_id = dict(desired)
-        desired_source_ids = (
-            {n.node_id for n in source_nodes} if source_nodes else set()
-        )
-
-        # Groups to add (new group IDs)
-        for gid in desired_by_id.keys() - current_by_id.keys():
-            members = desired_by_id[gid]
-
-            # Only create group if there are 2+ targets
-            if len(members) < 2:
-                LOGGER.debug(
-                    "Skipping group %d creation: only %d target(s), need 2+",
-                    gid,
-                    len(members),
-                )
-                continue
-
-            key, is_new = self._store.acquire_group(
-                automation_id,
-                gid,
-                f"AutoBind-{automation_id[:16]}",
-                list(members),
-            )
-            if is_new:
-                # Actually create group on devices - pass source nodes for key distribution
-                source_ids = [n.node_id for n in source_nodes] if source_nodes else None
-                await self._group_manager.create_group_on_devices(
-                    gid, members, source_ids
-                )
-            LOGGER.debug("Acquired group %s (new=%s)", key, is_new)
-
-        # Groups to update (same ID, different members or sources)
-        for gid in current_by_id.keys() & desired_by_id.keys():
-            current_members = current_by_id[gid]
-            desired_members = desired_by_id[gid]
-            key = group_key(gid)
-
-            # Check if group should be removed (less than 2 targets remaining)
-            if len(desired_members) < 2:
-                LOGGER.info(
-                    "Group %d reduced to %d target(s), removing group",
-                    gid,
-                    len(desired_members),
-                )
-                should_remove = self._store.release_group(automation_id, key)
-                if should_remove:
-                    # Remove from all devices (targets AND sources)
-                    await self._group_manager.remove_group_completely(
-                        gid, current_members
+            if isinstance(raw_bindings, dict):
+                if raw_bindings.get("TLVValue") is None or raw_bindings.get("Reason"):
+                    LOGGER.debug(
+                        "Node %d binding cluster error on endpoint 1: %s",
+                        node_id,
+                        raw_bindings.get("Reason", "Unknown error"),
                     )
-                continue
-
-            # Handle member changes
-            if current_members != desired_members:
-                members_to_add = desired_members - current_members
-                members_to_remove = current_members - desired_members
-
-                # For new target members, set up GroupKeyMap first
-                if members_to_add:
-                    source_ids = (
-                        [n.node_id for n in source_nodes] if source_nodes else None
-                    )
-                    await self._group_manager.setup_group_key_for_new_members(
-                        gid, members_to_add, source_ids
-                    )
-
-                # Update target group membership
-                for node_id, endpoint_id in members_to_add:
-                    await self._group_manager.add_device_to_group(
-                        gid, node_id, endpoint_id
-                    )
-                for node_id, endpoint_id in members_to_remove:
-                    await self._group_manager.remove_device_from_group(
-                        gid, node_id, endpoint_id
-                    )
-
-                # Update store with new members
-                self._store.update_group_members(key, list(desired_members))
-
-            # Handle source node changes
-            group_resource = self._store.get_group_resource(key)
-            if group_resource:
-                current_source_ids = set(group_resource.get("source_nodes", []))
-                sources_to_add = desired_source_ids - current_source_ids
-                sources_to_remove = current_source_ids - desired_source_ids
-
-                # Add GroupKeyMap to new sources
-                if sources_to_add:
-                    await self._group_manager.setup_group_key_for_sources(
-                        gid, sources_to_add
-                    )
-
-                # Remove GroupKeyMap from old sources
-                if sources_to_remove:
-                    await self._group_manager.remove_group_key_from_sources(
-                        gid, sources_to_remove
-                    )
-
-                # Update store with new source list
-                if sources_to_add or sources_to_remove:
-                    self._store.update_group_source_nodes(key, list(desired_source_ids))
-
-        # Groups to remove (no longer needed)
-        for gid in current_by_id.keys() - desired_by_id.keys():
-            key = group_key(gid)
-            should_remove = self._store.release_group(automation_id, key)
-            if should_remove:
-                # Remove from all devices (targets AND sources)
-                members = current_by_id[gid]
-                await self._group_manager.remove_group_completely(gid, members)
-            LOGGER.debug("Released group %s (removed=%s)", key, should_remove)
-
-    async def _release_all_resources(self, automation_id: str) -> None:
-        """Release all resources for an automation.
-
-        Args:
-            automation_id: The automation to clean up.
-        """
-        LOGGER.info("Releasing all resources for automation %s", automation_id)
-
-        resources = self._store.get_automation_resources(automation_id)
-        if resources is None:
-            return
-
-        # Release bindings first (they may reference groups)
-        for key in list(resources["binding_keys"]):
-            binding = self._store.get_binding_resource(key)
-            should_remove = self._store.release_binding(automation_id, key)
-            if should_remove and binding:
-                target: int | str
-                if binding["target_group_id"] is not None:
-                    target = f"g{binding['target_group_id']}"
                 else:
-                    target = binding["target_node_id"] or 0
-                await self._adapter.remove_binding(
-                    binding["source_node_id"],
-                    binding["source_endpoint"],
-                    target,
-                    binding["target_endpoint"],
-                )
+                    binding_read_success = True
+            elif isinstance(raw_bindings, list):
+                current_bindings = raw_bindings
+                binding_read_success = True
+        except (HomeAssistantError, OSError, ValueError):
+            LOGGER.debug(
+                "Failed to read bindings from endpoint 1 on node %d",
+                node_id,
+            )
 
-        # Release ACLs
-        for key in list(resources["acl_keys"]):
-            acl = self._store.get_acl_resource(key)
-            should_remove = self._store.release_acl(automation_id, key)
-            if should_remove and acl:
-                await self._adapter.remove_acl(
-                    acl["target_node_id"],
-                    acl["source_node_id"],
+        if not binding_read_success:
+            binding_path = "0/30/0"
+            try:
+                current_bindings_resp = await matter_client.read_attribute(
+                    node_id, binding_path
                 )
+                raw_bindings = current_bindings_resp.get(binding_path, [])
 
-        # Release groups last
-        for key in list(resources["group_keys"]):
-            group = self._store.get_group_resource(key)
-            should_remove = self._store.release_group(automation_id, key)
-            if should_remove and group:
-                members = frozenset(
-                    (m["node_id"], m["endpoint_id"]) for m in group["members"]
-                )
-                await self._group_manager.remove_group_from_devices(
-                    group["group_id"], members
-                )
+                if isinstance(raw_bindings, dict):
+                    if raw_bindings.get("TLVValue") is None or raw_bindings.get(
+                        "Reason"
+                    ):
+                        LOGGER.warning(
+                            "Node %d does not support binding cluster: %s",
+                            node_id,
+                            raw_bindings.get("Reason", "Unknown error"),
+                        )
+                        return None
+                    current_bindings = [raw_bindings]
+                elif isinstance(raw_bindings, list):
+                    current_bindings = raw_bindings
+                    binding_read_success = True
+            except (HomeAssistantError, OSError, ValueError) as err:
+                LOGGER.warning("Failed to read bindings from node %d: %s", node_id, err)
+                return None
 
-        # Clear automation resources mapping
-        await self._store.async_clear_automation_resources(automation_id)
-
+        LOGGER.debug("Current bindings on node %d: %s", node_id, current_bindings)
+        return current_bindings, binding_path

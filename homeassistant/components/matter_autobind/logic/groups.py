@@ -15,14 +15,24 @@ from typing import TYPE_CHECKING, Any
 
 from chip.clusters import Objects as Clusters
 
+from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 
 if TYPE_CHECKING:
-    from homeassistant.core import HomeAssistant
-
-from homeassistant.components.matter.helpers import get_matter
+    from homeassistant.components.matter.helpers import (  # pylint: disable=hass-component-root-import
+        get_matter as _get_matter,
+    )
+else:
+    from homeassistant.components.matter.helpers import (  # pylint: disable=hass-component-root-import
+        get_matter as _get_matter,
+    )
 
 from ..store import MatterBindingStore, group_key
+
+
+def get_matter(hass: HomeAssistant) -> Any:
+    """Wrapper for get_matter to satisfy type checking."""
+    return _get_matter(hass)
 
 
 class GroupManager:
