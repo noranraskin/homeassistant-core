@@ -317,7 +317,20 @@ class AutomationAnalyzer:
         # Check if there are conditions defined using getattr
         # to avoid linter warnings about private attribute access
         cond_func = getattr(automation_entity, "_cond_func", None)
-        return cond_func is not None
+        if cond_func is None:
+            return False
+
+        # The _cond_func has a 'config' attribute that contains the actual
+        # condition configurations. If it exists but is empty, there are
+        # effectively no conditions. This happens when the UI creates an
+        # automation with conditions: [] (empty array).
+        config = getattr(cond_func, "config", None)
+        if config is None:
+            # No config attribute - assume has conditions if cond_func exists
+            return True
+
+        # If config exists but is empty list, there are no actual conditions
+        return len(config) > 0
 
     def _determine_eligibility(self, analysis: AutomationAnalysis) -> None:
         """Determine the eligibility of an automation analysis.

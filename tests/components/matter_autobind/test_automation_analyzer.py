@@ -42,8 +42,10 @@ async def test_analyze_automation_with_conditions(
 
     # Mock automation entity
     mock_automation = MagicMock()
-    # has_conditions checks for _cond_func being present
-    mock_automation._cond_func = lambda: True
+    # has_conditions checks for _cond_func being present with non-empty config
+    mock_cond_func = MagicMock()
+    mock_cond_func.config = [{"condition": "state"}]  # Non-empty config
+    mock_automation._cond_func = mock_cond_func
 
     with patch(
         "homeassistant.components.matter_autobind.automation.analyzer.DATA_COMPONENT",
@@ -60,6 +62,51 @@ async def test_analyze_automation_with_conditions(
     assert not result.eligible
     assert result.reason == EligibilityReason.HAS_CONDITIONS
     assert result.has_conditions
+
+
+async def test_analyze_automation_with_empty_conditions(
+    hass: HomeAssistant, analyzer: AutomationAnalyzer
+) -> None:
+    """Test analyzing an automation with empty conditions list (UI default)."""
+    automation_id = "automation.test"
+    trigger_entity = "switch.source"
+    action_entity = "light.target"
+
+    # Mock automation entity
+    mock_automation = MagicMock()
+    # When UI creates automation with no conditions, _cond_func exists but config is empty
+    mock_cond_func = MagicMock()
+    mock_cond_func.config = []  # Empty config - effectively no conditions
+    mock_automation._cond_func = mock_cond_func
+
+    # Mock trigger config
+    mock_automation._trigger_config = [
+        {CONF_PLATFORM: "state", CONF_ENTITY_ID: trigger_entity}
+    ]
+
+    # Mock action script
+    mock_script = MagicMock()
+    mock_script.referenced_entities = {action_entity}
+    mock_script.referenced_devices = set()
+    type(mock_automation).action_script = PropertyMock(return_value=mock_script)
+
+    with (
+        patch(
+            "homeassistant.components.matter_autobind.automation.analyzer.DATA_COMPONENT",
+            "automation",
+        ),
+        patch.object(analyzer, "_is_matter_entity", return_value=True),
+    ):
+        hass.data["automation"] = MagicMock()
+        hass.data["automation"].get_entity.return_value = mock_automation
+        hass.states.async_set(automation_id, "on")
+
+        result = await analyzer.analyze(automation_id)
+
+    # Empty conditions should NOT make automation ineligible
+    assert not result.has_conditions
+    assert result.eligible
+    assert result.reason == EligibilityReason.ELIGIBLE
 
 
 async def test_analyze_eligible_automation(
