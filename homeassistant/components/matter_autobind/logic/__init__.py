@@ -8,3 +8,7 @@ Submodules:
 - reconciler: Logic to diff Desired vs Current state
 - groups: Group key generation and propagation
 """
+
+from .groups import GroupManager
+
+__all__ = ["GroupManager"]
