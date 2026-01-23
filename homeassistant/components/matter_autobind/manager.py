@@ -34,6 +34,7 @@ from homeassistant.helpers.event import (
     async_track_state_change_event,
 )
 
+from .automation import is_physical_state_change
 from .const import (
     CLUSTER_ID_BINDING,
     CLUSTER_ID_ON_OFF,
@@ -175,54 +176,6 @@ class MatterBindingManager:
         return self._store
 
     @callback
-    def is_physical_state_change(self, event: Event[EventStateChangedData]) -> bool:
-        """Determine if a state change originated from a physical device interaction.
-
-        This is used to differentiate between:
-        - UI/service call initiated changes -> automation should run normally
-        - Physical device button presses -> automation should be suppressed
-          (the binding handles the direct control)
-
-        Args:
-            event: The state changed event to analyze.
-
-        Returns:
-            True if the change was from physical device interaction (suppress automation).
-            False if the change was from UI/HA service call (run automation normally).
-        """
-        entity_id = event.data["entity_id"]
-        context = event.context
-
-        # If user_id is set, this was from the UI or a user-initiated service call
-        if context.user_id is not None:
-            LOGGER.debug(
-                "State change for %s originated from UI (user_id: %s)",
-                entity_id,
-                context.user_id,
-            )
-            return False
-
-        # If parent_id is set but no user_id, it's from an automation/script
-        # which means it could be from our own automation triggering
-        if context.parent_id is not None:
-            LOGGER.debug(
-                "State change for %s originated from automation/script (parent_id: %s)",
-                entity_id,
-                context.parent_id,
-            )
-            return False
-
-        # If neither user_id nor parent_id is set, this is likely from:
-        # - Device state update (physical button press)
-        # - Integration pushing state (e.g., Matter server reporting device change)
-        LOGGER.debug(
-            "State change for %s originated from device (no context parent/user) - "
-            "this is a physical interaction, automation will be suppressed",
-            entity_id,
-        )
-        return True
-
-    @callback
     def _subscribe_to_trigger_entity(
         self, trigger_entity_id: str, automation_id: str
     ) -> None:
@@ -297,7 +250,7 @@ class MatterBindingManager:
                 return
 
         # Check if this is a physical state change
-        if not self.is_physical_state_change(event):
+        if not is_physical_state_change(event, LOGGER):
             LOGGER.debug(
                 "State change on %s was from UI/automation - letting automation run",
                 entity_id,

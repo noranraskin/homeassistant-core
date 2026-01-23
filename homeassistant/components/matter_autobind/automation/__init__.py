@@ -9,10 +9,17 @@ Submodules:
 - models: Automation eligibility dataclasses
 """
 
-from .models import ActionInfo, AutomationAnalysis, TriggerInfo
+from .analyzer import AutomationAnalyzer, to_legacy_eligibility_result
+from .filter import is_physical_state_change, should_suppress_automation
+from .models import ActionInfo, AutomationAnalysis, EligibilityReason, TriggerInfo
 
 __all__ = [
     "ActionInfo",
     "AutomationAnalysis",
+    "AutomationAnalyzer",
+    "EligibilityReason",
     "TriggerInfo",
+    "is_physical_state_change",
+    "should_suppress_automation",
+    "to_legacy_eligibility_result",
 ]
