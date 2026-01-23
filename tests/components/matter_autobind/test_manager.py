@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from homeassistant.components.matter_autobind.manager import MatterBindingManager
+from homeassistant.components.matter_autobind.logic.manager import MatterBindingManager
 from homeassistant.components.matter_autobind.store import MatterBindingStore
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import entity_registry as er
@@ -200,7 +200,7 @@ async def test_scan_automations_finds_matter_entities(
     # Mock the automation's referenced entities and run scan
     with (
         patch(
-            "homeassistant.components.matter_autobind.manager.entities_in_automation",
+            "homeassistant.components.matter_autobind.automation.analyzer.entities_in_automation",
             return_value=[matter_entry.entity_id],
         ),
         caplog.at_level("INFO"),
@@ -244,7 +244,7 @@ async def test_scan_automations_no_matter_entities(
     # Mock the automation's referenced entities and run scan
     with (
         patch(
-            "homeassistant.components.matter_autobind.manager.entities_in_automation",
+            "homeassistant.components.matter_autobind.automation.analyzer.entities_in_automation",
             return_value=[zha_entry.entity_id],
         ),
         caplog.at_level("INFO"),

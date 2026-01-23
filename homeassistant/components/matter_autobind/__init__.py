@@ -14,7 +14,7 @@ from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
 
 from .const import DOMAIN, LOGGER
-from .manager import MatterBindingManager
+from .logic.manager import MatterBindingManager
 from .store import MatterBindingStore
 
 if TYPE_CHECKING:

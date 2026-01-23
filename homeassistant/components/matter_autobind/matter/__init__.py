@@ -11,14 +11,26 @@ Submodules:
 
 from .adapter import MatterAdapter
 from .cluster_map import ClusterMap, get_clusters_for_service, get_primary_cluster
-from .models import BindingTarget, GroupTarget, NodeTarget
+from .models import (
+    AclEntry,
+    BindingTarget,
+    GroupInfo,
+    GroupMember,
+    GroupTarget,
+    NodeTarget,
+    StatefulSwitchInfo,
+)
 
 __all__ = [
+    "AclEntry",
     "BindingTarget",
     "ClusterMap",
+    "GroupInfo",
+    "GroupMember",
     "GroupTarget",
     "MatterAdapter",
     "NodeTarget",
+    "StatefulSwitchInfo",
     "get_clusters_for_service",
     "get_primary_cluster",
 ]

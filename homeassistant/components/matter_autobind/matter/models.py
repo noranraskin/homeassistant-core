@@ -12,6 +12,21 @@ from typing import Any
 
 
 @dataclass
+class StatefulSwitchInfo:
+    """Information about a stateful switch entity.
+
+    Stateful switches have both server and client clusters on the same endpoint.
+    They need special handling to track whether state changes are from UI or
+    physical device interactions.
+    """
+
+    entity_id: str
+    node_id: int
+    endpoint_id: int
+    client_clusters: list[int]
+
+
+@dataclass
 class BindingTarget(ABC):
     """Base class for binding targets.
 

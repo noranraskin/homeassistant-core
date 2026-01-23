@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from chip.clusters import Objects as Clusters
@@ -26,21 +25,22 @@ from homeassistant.helpers.event import (
     async_track_state_change_event,
 )
 
-from .automation import (
+from ..automation import (
     AutomationAnalyzer,
     is_physical_state_change,
     to_legacy_eligibility_result,
 )
-from .const import (
+from ..const import (
     CLUSTER_ID_BINDING,
     CLUSTER_ID_ON_OFF,
     DEBUG_OVERWRITE_ACLS,
     DOMAIN,
     LOGGER,
 )
-from .logic import GroupManager, NodeInfo, ResourceReconciler
-from .matter import MatterAdapter
-from .store import EligibilityStatus, MatterBindingStore
+from ..discovery import async_discover_client_cluster_entities
+from ..matter import MatterAdapter, StatefulSwitchInfo
+from ..store import EligibilityStatus, MatterBindingStore
+from . import GroupManager, NodeInfo, ResourceReconciler
 
 if TYPE_CHECKING:
     from homeassistant.components.matter.helpers import (  # pylint: disable=hass-component-root-import
@@ -53,8 +53,6 @@ else:
         get_matter as _get_matter,
         get_node_from_device_entry as _get_node_from_device_entry,
     )
-
-from .discovery import async_discover_client_cluster_entities
 
 
 def get_matter(hass: HomeAssistant) -> Any:
@@ -69,28 +67,6 @@ def get_node_from_device_entry(hass: HomeAssistant, device_entry: Any) -> Any:
 
 # Matter domain constant
 MATTER_DOMAIN = "matter"
-
-
-@dataclass
-class StatefulSwitchInfo:
-    """Information about a stateful switch entity.
-
-    Stateful switches have both server and client clusters on the same endpoint.
-    They need special handling to track whether state changes are from UI or
-    physical device interactions.
-    """
-
-    entity_id: str
-    """The entity_id of the stateful switch."""
-
-    node_id: int
-    """The Matter node ID."""
-
-    endpoint_id: int
-    """The endpoint ID with both server and client clusters."""
-
-    client_clusters: list[int]
-    """List of client cluster IDs available for binding."""
 
 
 class MatterBindingManager:
