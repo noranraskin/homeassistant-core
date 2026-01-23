@@ -43,6 +43,7 @@ from .const import (
     DOMAIN as AUTOBIND_DOMAIN,
     LOGGER,
 )
+from .matter import MatterAdapter
 from .store import (
     AclEntryDict,
     BindingEntryDict,
@@ -169,6 +170,10 @@ class MatterBindingManager:
         # Track automations currently being suppressed (temporary disable)
         # Used to prevent binding removal when we temporarily disable automation
         self._suppressing_automations: set[str] = set()
+        # Matter adapter for ACL/binding operations
+        self._adapter = MatterAdapter(
+            hass, LOGGER, debug_overwrite_acls=DEBUG_OVERWRITE_ACLS
+        )
 
     @property
     def store(self) -> MatterBindingStore:
@@ -2462,7 +2467,7 @@ class MatterBindingManager:
             )
             if is_new:
                 # Actually write ACL to device with correct auth_mode
-                await self._write_acl_to_device(target_node, subject, auth_mode)
+                await self._adapter.write_acl(target_node, subject, auth_mode)
             LOGGER.debug(
                 "Acquired ACL %s (new=%s, auth_mode=%d)", key, is_new, auth_mode
             )
@@ -2472,7 +2477,7 @@ class MatterBindingManager:
             should_remove = self._store.release_acl(automation_id, key)
             if should_remove:
                 # Actually remove ACL from device
-                await self._remove_acl_from_device(target_node, subject, auth_mode)
+                await self._adapter.remove_acl(target_node, subject, auth_mode)
             LOGGER.debug("Released ACL %s (removed=%s)", key, should_remove)
 
     async def _reconcile_bindings(
@@ -2502,9 +2507,7 @@ class MatterBindingManager:
                 target,
                 is_new,
             )
-            await self._write_binding_to_device(
-                source_node, source_ep, target, target_ep
-            )
+            await self._adapter.write_binding(source_node, source_ep, target, target_ep)
             LOGGER.debug("Acquired binding %s (new=%s)", key, is_new)
 
         for source_node, source_ep, target, target_ep in to_remove:
@@ -2512,7 +2515,7 @@ class MatterBindingManager:
             should_remove = self._store.release_binding(automation_id, key)
             if should_remove:
                 # Actually remove binding from device
-                await self._remove_binding_from_device(
+                await self._adapter.remove_binding(
                     source_node, source_ep, target, target_ep
                 )
             LOGGER.debug("Released binding %s (removed=%s)", key, should_remove)
@@ -2659,7 +2662,7 @@ class MatterBindingManager:
                     target = f"g{binding['target_group_id']}"
                 else:
                     target = binding["target_node_id"] or 0
-                await self._remove_binding_from_device(
+                await self._adapter.remove_binding(
                     binding["source_node_id"],
                     binding["source_endpoint"],
                     target,
@@ -2671,7 +2674,7 @@ class MatterBindingManager:
             acl = self._store.get_acl_resource(key)
             should_remove = self._store.release_acl(automation_id, key)
             if should_remove and acl:
-                await self._remove_acl_from_device(
+                await self._adapter.remove_acl(
                     acl["target_node_id"],
                     acl["source_node_id"],
                 )
@@ -2688,560 +2691,6 @@ class MatterBindingManager:
 
         # Clear automation resources mapping
         await self._store.async_clear_automation_resources(automation_id)
-
-    # =========================================================================
-    # Device Operations (Write/Remove to Matter devices)
-    # =========================================================================
-
-    async def _write_acl_to_device(
-        self, target_node_id: int, subject: int, auth_mode: int = 2
-    ) -> None:
-        """Write ACL entry to a Matter device.
-
-        Args:
-            target_node_id: The node to write the ACL to.
-            subject: The subject to grant access (node_id for CASE, group_id for GROUP).
-            auth_mode: The authentication mode:
-                2 = CASE (node-to-node unicast, subject is source node ID)
-                3 = GROUP (group multicast, subject is group ID)
-        """
-        try:
-            matter = get_matter(self._hass)
-            matter_client = matter.matter_client
-        except (KeyError, StopIteration):
-            LOGGER.warning("Matter integration not available for ACL write")
-            return
-
-        auth_mode_name = "GROUP" if auth_mode == 3 else "CASE"
-
-        try:
-            acl_path = "0/31/0"
-            LOGGER.debug(
-                "Reading current ACLs from node %d path %s", target_node_id, acl_path
-            )
-            current_acls = await matter_client.read_attribute(target_node_id, acl_path)
-            current_acl_list = current_acls.get(acl_path, [])
-            LOGGER.debug(
-                "Current ACLs on node %d: %d entries",
-                target_node_id,
-                len(current_acl_list),
-            )
-
-            # Get fabric ID and controller subject
-            server_info = matter_client.server_info
-            if server_info is None:
-                LOGGER.error("Matter server info not available")
-                return
-            fabric_id = server_info.fabric_id
-            # Controller subject is typically in compressed_fabric_id or we use a known value
-            # The admin ACL usually has privilege=5 and authMode=2 (CASE)
-
-            # In DEBUG_OVERWRITE_ACLS mode, we clean up duplicate/invalid entries
-            if DEBUG_OVERWRITE_ACLS:
-                LOGGER.warning(
-                    "⚠️ DEBUG_OVERWRITE_ACLS: Cleaning up ACLs on node %d",
-                    target_node_id,
-                )
-                # Keep only the controller's admin ACL (privilege 5, our fabric)
-                # and remove duplicates
-                cleaned_entries: list[dict[str, Any]] = []
-                seen_acls: set[tuple[int, int, tuple[int, ...]]] = set()
-
-                for acl_entry in current_acl_list:
-                    if not isinstance(acl_entry, dict):
-                        continue
-
-                    # Check for required fields
-                    if "1" not in acl_entry or "2" not in acl_entry:
-                        LOGGER.warning(
-                            "Removing invalid ACL entry (missing fields): %s", acl_entry
-                        )
-                        continue
-
-                    privilege = acl_entry.get("1", 0)
-                    entry_auth_mode = acl_entry.get("2", 0)
-                    subjects = tuple(acl_entry.get("3", []) or [])
-                    entry_fabric = acl_entry.get("254", 0)
-
-                    # Skip entries from other fabrics
-                    if entry_fabric != fabric_id:
-                        cleaned_entries.append(acl_entry)
-                        continue
-
-                    # Create a signature for deduplication
-                    sig = (privilege, entry_auth_mode, subjects)
-                    if sig in seen_acls:
-                        LOGGER.warning(
-                            "Removing duplicate ACL entry: privilege=%d, authMode=%d, subjects=%s",
-                            privilege,
-                            entry_auth_mode,
-                            subjects,
-                        )
-                        continue
-
-                    # Keep controller admin ACL (privilege 5)
-                    if privilege == 5:
-                        seen_acls.add(sig)
-                        cleaned_entries.append(acl_entry)
-                        LOGGER.debug("Keeping admin ACL: subjects=%s", subjects)
-                        continue
-
-                    # Remove all other Operate (privilege 3) ACLs - we'll add ours fresh
-                    LOGGER.info(
-                        "Removing stale ACL: privilege=%d, authMode=%d, subjects=%s",
-                        privilege,
-                        entry_auth_mode,
-                        subjects,
-                    )
-
-                current_acl_list = cleaned_entries
-                LOGGER.info(
-                    "After cleanup, node %d has %d ACL entries",
-                    target_node_id,
-                    len(cleaned_entries),
-                )
-            else:
-                # Normal mode: check if already exists
-                for acl_entry in current_acl_list:
-                    if isinstance(acl_entry, dict):
-                        subjects = acl_entry.get("3", []) or []
-                        entry_auth_mode = acl_entry.get("2", 0)
-                    else:
-                        subjects = getattr(acl_entry, "subjects", []) or []
-                        entry_auth_mode = getattr(acl_entry, "authMode", 0)
-                    if subject in subjects and entry_auth_mode == auth_mode:
-                        LOGGER.debug(
-                            "ACL already exists: subject %d, authMode %s on node %d",
-                            subject,
-                            auth_mode_name,
-                            target_node_id,
-                        )
-                        return
-
-                # Filter invalid entries
-                current_acl_list = [
-                    e
-                    for e in current_acl_list
-                    if (isinstance(e, dict) and "1" in e and "2" in e)
-                    or (hasattr(e, "privilege") and hasattr(e, "authMode"))
-                ]
-
-            # Create new ACL entry with correct authMode
-            # For GROUP auth (3), we also add endpoint targets
-            if auth_mode == 3:
-                # GROUP ACL - restrict to endpoint 1 (typical application endpoint)
-                new_acl_entry = {
-                    "254": fabric_id,
-                    "1": 3,  # Operate privilege
-                    "2": 3,  # GROUP authMode
-                    "3": [subject],  # group_id
-                    "4": [{"cluster": None, "endpoint": 1, "deviceType": None}],
-                }
-                LOGGER.info(
-                    "Creating GROUP ACL: fabric=%d, group_id=%d, authMode=GROUP (3)",
-                    fabric_id,
-                    subject,
-                )
-            else:
-                # CASE ACL - node-to-node (no target restriction)
-                new_acl_entry = {
-                    "254": fabric_id,
-                    "1": 3,  # Operate privilege
-                    "2": 2,  # CASE authMode
-                    "3": [subject],  # source_node_id
-                    "4": None,
-                }
-                LOGGER.info(
-                    "Creating CASE ACL: fabric=%d, node_id=%d, authMode=CASE (2)",
-                    fabric_id,
-                    subject,
-                )
-
-            updated_list = [*current_acl_list, new_acl_entry]
-            LOGGER.debug(
-                "Writing %d ACL entries to node %d", len(updated_list), target_node_id
-            )
-
-            await matter_client.write_attribute(
-                node_id=target_node_id,
-                attribute_path=acl_path,
-                value=updated_list,
-            )
-
-            # Verify write succeeded
-            verify_resp = await matter_client.read_attribute(target_node_id, acl_path)
-            verify_acl_list = verify_resp.get(acl_path, [])
-
-            # Check if our subject is now in the ACL with correct authMode
-            found = False
-            for acl_entry in verify_acl_list:
-                if isinstance(acl_entry, dict):
-                    subjects = acl_entry.get("3", []) or []
-                    entry_auth_mode = acl_entry.get("2", 0)
-                else:
-                    subjects = getattr(acl_entry, "subjects", []) or []
-                    entry_auth_mode = getattr(acl_entry, "authMode", 0)
-                if subject in subjects and entry_auth_mode == auth_mode:
-                    found = True
-                    break
-
-            if found:
-                LOGGER.info(
-                    "✓ ACL WRITE VERIFIED: node %d has %s ACL for subject %d",
-                    target_node_id,
-                    auth_mode_name,
-                    subject,
-                )
-            else:
-                LOGGER.error(
-                    "✗ ACL WRITE FAILED: node %d missing %s ACL for subject %d (total=%d)",
-                    target_node_id,
-                    auth_mode_name,
-                    subject,
-                    len(verify_acl_list),
-                )
-
-        except (HomeAssistantError, OSError, ValueError) as err:
-            LOGGER.error("Failed to write ACL: %s", err)
-
-    async def _remove_acl_from_device(
-        self, target_node_id: int, subject: int, auth_mode: int = 2
-    ) -> None:
-        """Remove ACL entry from a Matter device.
-
-        Args:
-            target_node_id: The node to remove ACL from.
-            subject: The subject to remove (node_id for CASE, group_id for GROUP).
-            auth_mode: The authentication mode (2=CASE, 3=GROUP).
-        """
-        try:
-            matter = get_matter(self._hass)
-            matter_client = matter.matter_client
-        except (KeyError, StopIteration):
-            return
-
-        auth_mode_name = "GROUP" if auth_mode == 3 else "CASE"
-
-        try:
-            acl_path = "0/31/0"
-            current_acls = await matter_client.read_attribute(target_node_id, acl_path)
-            current_acl_list = current_acls.get(acl_path, [])
-
-            # Filter out entries matching subject AND auth_mode
-            updated_list = []
-            for acl_entry in current_acl_list:
-                if isinstance(acl_entry, dict):
-                    subjects = acl_entry.get("3", []) or []
-                    entry_auth_mode = acl_entry.get("2", 0)
-                else:
-                    subjects = getattr(acl_entry, "subjects", []) or []
-                    entry_auth_mode = getattr(acl_entry, "authMode", 0)
-
-                # Keep entry if subject not in subjects OR auth_mode differs
-                if subject not in subjects or entry_auth_mode != auth_mode:
-                    updated_list.append(acl_entry)
-
-            if len(updated_list) < len(current_acl_list):
-                await matter_client.write_attribute(
-                    node_id=target_node_id,
-                    attribute_path=acl_path,
-                    value=updated_list,
-                )
-                LOGGER.info(
-                    "Removed %s ACL from node %d for subject %d",
-                    auth_mode_name,
-                    target_node_id,
-                    subject,
-                )
-
-        except (HomeAssistantError, OSError, ValueError) as err:
-            LOGGER.error("Failed to remove ACL: %s", err)
-
-    async def _write_binding_to_device(
-        self,
-        source_node_id: int,
-        source_endpoint: int,
-        target: int | str,
-        target_endpoint: int,
-    ) -> None:
-        """Write binding entry to a Matter device."""
-        try:
-            matter = get_matter(self._hass)
-            matter_client = matter.matter_client
-        except (KeyError, StopIteration):
-            LOGGER.warning("Matter integration not available for binding write")
-            return
-
-        try:
-            binding_path = f"{source_endpoint}/30/0"
-            LOGGER.info(
-                "Writing binding on node %d: ep %d -> target %s (ep %d)",
-                source_node_id,
-                source_endpoint,
-                target,
-                target_endpoint,
-            )
-            current_bindings_resp = await matter_client.read_attribute(
-                source_node_id, binding_path
-            )
-            current_bindings = current_bindings_resp.get(binding_path, [])
-            LOGGER.debug(
-                "Current bindings on node %d: %s", source_node_id, current_bindings
-            )
-
-            if not isinstance(current_bindings, list):
-                current_bindings = []
-
-            # Filter out invalid binding entries
-            valid_bindings = []
-            for binding in current_bindings:
-                if isinstance(binding, dict):
-                    # Valid binding must have fabric index (254) and either
-                    # node (1) for unicast or group (2) for group binding
-                    if "254" in binding and ("1" in binding or "2" in binding):
-                        valid_bindings.append(binding)
-                    else:
-                        LOGGER.warning(
-                            "Filtering invalid binding entry on node %d: %s",
-                            source_node_id,
-                            binding,
-                        )
-                elif hasattr(binding, "fabricIndex"):
-                    # Object format - check for node or group
-                    if hasattr(binding, "node") or hasattr(binding, "group"):
-                        valid_bindings.append(binding)
-                    else:
-                        LOGGER.warning(
-                            "Filtering invalid binding entry on node %d: %s",
-                            source_node_id,
-                            binding,
-                        )
-                else:
-                    LOGGER.warning(
-                        "Filtering invalid binding entry on node %d: %s",
-                        source_node_id,
-                        binding,
-                    )
-
-            # Get fabric ID
-            server_info = matter_client.server_info
-            if server_info is None:
-                LOGGER.error("Matter server info not available")
-                return
-            fabric_id = server_info.fabric_id
-
-            # Create binding entry
-            if isinstance(target, str) and target.startswith("g"):
-                # Group binding - only needs group ID and fabric
-                group_id = int(target[1:])
-                new_binding = {
-                    "254": fabric_id,
-                    "2": group_id,  # group field (index 2 in TargetStruct)
-                }
-                LOGGER.info(
-                    "Creating GROUP binding: node %d -> group %d",
-                    source_node_id,
-                    group_id,
-                )
-
-                # Check if this group binding already exists in valid bindings
-                for existing in valid_bindings:
-                    if isinstance(existing, dict) and existing.get("2") == group_id:
-                        LOGGER.info(
-                            "✓ Group binding to %d already exists on node %d, skipping",
-                            group_id,
-                            source_node_id,
-                        )
-                        return
-            else:
-                # Unicast binding
-                new_binding = {
-                    "254": fabric_id,
-                    "1": int(target),  # node field
-                    "3": target_endpoint,  # endpoint field
-                    "4": None,  # cluster field (None = all clusters)
-                }
-                LOGGER.info(
-                    "Creating UNICAST binding: node %d -> node %d ep %d",
-                    source_node_id,
-                    target,
-                    target_endpoint,
-                )
-
-                # Check if this unicast binding already exists in valid bindings
-                for existing in valid_bindings:
-                    if isinstance(existing, dict):
-                        if (
-                            existing.get("1") == int(target)
-                            and existing.get("3") == target_endpoint
-                        ):
-                            LOGGER.info(
-                                "✓ Unicast binding to node %d already exists on node %d, skipping",
-                                target,
-                                source_node_id,
-                            )
-                            return
-
-            # Use valid_bindings instead of current_bindings
-            updated_bindings = [*valid_bindings, new_binding]
-            LOGGER.debug(
-                "Writing %d bindings to node %d (was %d, filtered %d invalid): %s",
-                len(updated_bindings),
-                source_node_id,
-                len(current_bindings),
-                len(current_bindings) - len(valid_bindings),
-                updated_bindings,
-            )
-
-            await matter_client.write_attribute(
-                node_id=source_node_id,
-                attribute_path=binding_path,
-                value=updated_bindings,
-            )
-
-            # Verify write succeeded by reading back
-            verify_resp = await matter_client.read_attribute(
-                source_node_id, binding_path
-            )
-            verify_bindings = verify_resp.get(binding_path, [])
-            LOGGER.debug(
-                "After write, bindings on node %d: %s", source_node_id, verify_bindings
-            )
-
-            if len(verify_bindings) > len(current_bindings):
-                LOGGER.info(
-                    "✓ BINDING WRITE VERIFIED: node %d now has %d bindings (was %d)",
-                    source_node_id,
-                    len(verify_bindings),
-                    len(current_bindings),
-                )
-            else:
-                LOGGER.error(
-                    "✗ BINDING WRITE FAILED: node %d still has %d bindings (expected %d)",
-                    source_node_id,
-                    len(verify_bindings),
-                    len(updated_bindings),
-                )
-
-        except (HomeAssistantError, OSError, ValueError) as err:
-            LOGGER.error("Failed to write binding: %s", err)
-
-    async def _ensure_binding_on_device(
-        self,
-        source_node_id: int,
-        source_endpoint: int,
-        target: int | str,
-        target_endpoint: int,
-    ) -> None:
-        """Ensure a binding exists on a Matter device.
-
-        Checks if binding already exists on device before writing.
-        This fixes store/device sync issues from previous failed writes.
-        """
-        try:
-            matter = get_matter(self._hass)
-            matter_client = matter.matter_client
-        except (KeyError, StopIteration):
-            LOGGER.warning("Matter integration not available for binding check")
-            return
-
-        try:
-            binding_path = f"{source_endpoint}/30/0"
-            current_bindings_resp = await matter_client.read_attribute(
-                source_node_id, binding_path
-            )
-            current_bindings = current_bindings_resp.get(binding_path, [])
-
-            if not isinstance(current_bindings, list):
-                current_bindings = []
-
-            # Check if binding already exists on device
-            is_group = isinstance(target, str) and target.startswith("g")
-            target_value = int(target[1:]) if is_group else int(target)
-
-            binding_exists = False
-            for binding in current_bindings:
-                if isinstance(binding, dict):
-                    if is_group:
-                        if binding.get("2") == target_value:
-                            binding_exists = True
-                            break
-                    elif binding.get("1") == target_value:
-                        binding_exists = True
-                        break
-
-            if binding_exists:
-                LOGGER.debug(
-                    "Binding to %s already exists on node %d, skipping write",
-                    target,
-                    source_node_id,
-                )
-                return
-
-            # Binding doesn't exist, write it
-            LOGGER.info(
-                "Binding to %s not found on node %d, writing it now",
-                target,
-                source_node_id,
-            )
-            await self._write_binding_to_device(
-                source_node_id, source_endpoint, target, target_endpoint
-            )
-
-        except (HomeAssistantError, OSError, ValueError) as err:
-            LOGGER.error("Failed to ensure binding: %s", err)
-
-    async def _remove_binding_from_device(
-        self,
-        source_node_id: int,
-        source_endpoint: int,
-        target: int | str,
-        target_endpoint: int,
-    ) -> None:
-        """Remove binding entry from a Matter device."""
-        try:
-            matter = get_matter(self._hass)
-            matter_client = matter.matter_client
-        except (KeyError, StopIteration):
-            return
-
-        try:
-            binding_path = f"{source_endpoint}/30/0"
-            current_bindings_resp = await matter_client.read_attribute(
-                source_node_id, binding_path
-            )
-            current_bindings = current_bindings_resp.get(binding_path, [])
-
-            if not isinstance(current_bindings, list):
-                return
-
-            # Filter out the target binding
-            updated_bindings = []
-            is_group = isinstance(target, str) and target.startswith("g")
-            target_value = int(target[1:]) if is_group else int(target)
-
-            for binding in current_bindings:
-                if isinstance(binding, dict):
-                    if is_group:
-                        if binding.get("2") != target_value:
-                            updated_bindings.append(binding)
-                    elif binding.get("1") != target_value:
-                        updated_bindings.append(binding)
-                else:
-                    updated_bindings.append(binding)
-
-            if len(updated_bindings) < len(current_bindings):
-                await matter_client.write_attribute(
-                    node_id=source_node_id,
-                    attribute_path=binding_path,
-                    value=updated_bindings,
-                )
-                LOGGER.info(
-                    "Removed binding from node %d to %s", source_node_id, target
-                )
-
-        except (HomeAssistantError, OSError, ValueError) as err:
-            LOGGER.error("Failed to remove binding: %s", err)
 
     async def _create_group_on_devices(
         self,

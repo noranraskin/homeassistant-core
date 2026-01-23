@@ -9,6 +9,7 @@ Submodules:
 - models: Matter-specific dataclasses
 """
 
+from .adapter import MatterAdapter
 from .cluster_map import ClusterMap, get_clusters_for_service, get_primary_cluster
 from .models import BindingTarget, GroupTarget, NodeTarget
 
@@ -16,6 +17,7 @@ __all__ = [
     "BindingTarget",
     "ClusterMap",
     "GroupTarget",
+    "MatterAdapter",
     "NodeTarget",
     "get_clusters_for_service",
     "get_primary_cluster",
