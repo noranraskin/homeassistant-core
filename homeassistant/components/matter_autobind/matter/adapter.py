@@ -13,6 +13,9 @@ from typing import TYPE_CHECKING, Any
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 
+# Binding Cluster ID
+CLUSTER_ID_BINDING = 0x001E
+
 if TYPE_CHECKING:
     from homeassistant.components.matter.helpers import (  # pylint: disable=hass-component-root-import
         get_matter as _get_matter,
@@ -59,6 +62,59 @@ class MatterAdapter:
         self._hass = hass
         self._logger = logger or _LOGGER
         self._debug_overwrite_acls = debug_overwrite_acls
+
+    def _get_node(self, node_id: int) -> Any | None:
+        """Get a node by ID.
+
+        Args:
+            node_id: The node ID.
+
+        Returns:
+            The MatterNode instance or None.
+        """
+        try:
+            matter_client = self._get_matter_client()
+            return matter_client.node_devices.get(node_id)
+        except (RuntimeError, AttributeError):
+            return None
+
+    def _get_binding_endpoint(self, node_id: int, source_endpoint: int) -> int:
+        """Get the endpoint ID that has the Binding cluster.
+
+        Usually this is the same as source_endpoint, but we should verify.
+        If the specific endpoint has the Binding cluster, use it.
+        Otherwise, search for any endpoint with the Binding cluster.
+
+        Args:
+            node_id: The node ID.
+            source_endpoint: The proposed source endpoint.
+
+        Returns:
+            The endpoint ID to write bindings to.
+        """
+        node = self._get_node(node_id)
+        if not node:
+            return source_endpoint
+
+        # Check if requested endpoint has Binding cluster
+        endpoint = node.endpoints.get(source_endpoint)
+        if endpoint and endpoint.has_cluster(CLUSTER_ID_BINDING):
+            return source_endpoint
+
+        # Fallback: search across all endpoints
+        for ep_id, ep in node.endpoints.items():
+            if ep.has_cluster(CLUSTER_ID_BINDING):
+                self._logger.debug(
+                    "Endpoint %d does not have Binding cluster, using endpoint %d instead",
+                    source_endpoint,
+                    ep_id,
+                )
+                return ep_id
+
+        self._logger.warning(
+            "Node %d does not have Binding cluster on any endpoint", node_id
+        )
+        return source_endpoint
 
     def _get_matter_client(self) -> Any:
         """Get the Matter client.
@@ -360,7 +416,11 @@ class MatterAdapter:
             return False
 
         try:
-            binding_path = f"{source_endpoint}/30/0"
+            # Determine correct endpoint for binding
+            binding_endpoint = self._get_binding_endpoint(
+                source_node_id, source_endpoint
+            )
+            binding_path = f"{binding_endpoint}/30/0"
             self._logger.info(
                 "Writing binding on node %d: ep %d -> target %s (ep %d)",
                 source_node_id,
@@ -528,7 +588,11 @@ class MatterAdapter:
             return False
 
         try:
-            binding_path = f"{source_endpoint}/30/0"
+            # Determine correct endpoint for binding
+            binding_endpoint = self._get_binding_endpoint(
+                source_node_id, source_endpoint
+            )
+            binding_path = f"{binding_endpoint}/30/0"
             current_bindings_resp = await matter_client.read_attribute(
                 source_node_id, binding_path
             )
@@ -591,7 +655,11 @@ class MatterAdapter:
             return False
 
         try:
-            binding_path = f"{source_endpoint}/30/0"
+            # Determine correct endpoint for binding
+            binding_endpoint = self._get_binding_endpoint(
+                source_node_id, source_endpoint
+            )
+            binding_path = f"{binding_endpoint}/30/0"
             current_bindings_resp = await matter_client.read_attribute(
                 source_node_id, binding_path
             )

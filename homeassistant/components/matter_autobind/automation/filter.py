@@ -58,8 +58,9 @@ def is_physical_state_change(
         )
         return False
 
-    # If parent_id is set but no user_id, it's from an automation/script
-    # which means it could be from our own automation triggering
+    # If parent_id is set but no user_id, it's from an automation/script.
+    # Exception: Some integrations (like ZHA for scenes) currently set parent_id
+    # even for device-initiated changes, but generally parent_id implies internal HA logic.
     if context.parent_id is not None:
         log.debug(
             "State change for %s originated from automation/script (parent_id: %s)",
