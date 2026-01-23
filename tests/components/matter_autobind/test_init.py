@@ -16,7 +16,7 @@ async def test_setup_entry(
     mock_config_entry.add_to_hass(hass)
 
     with patch(
-        "homeassistant.components.matter_autobind.manager.MatterBindingManager.async_setup",
+        "homeassistant.components.matter_autobind.logic.manager.MatterBindingManager.async_setup",
         new_callable=AsyncMock,
     ) as mock_setup:
         assert await hass.config_entries.async_setup(mock_config_entry.entry_id)
@@ -40,11 +40,11 @@ async def test_unload_entry(
 
     with (
         patch(
-            "homeassistant.components.matter_autobind.manager.MatterBindingManager.async_setup",
+            "homeassistant.components.matter_autobind.logic.manager.MatterBindingManager.async_setup",
             new_callable=AsyncMock,
         ),
         patch(
-            "homeassistant.components.matter_autobind.manager.MatterBindingManager.async_shutdown",
+            "homeassistant.components.matter_autobind.logic.manager.MatterBindingManager.async_shutdown",
             new_callable=AsyncMock,
         ) as mock_shutdown,
     ):
@@ -71,7 +71,7 @@ async def test_setup_entry_initializes_domain_data(
     assert DOMAIN not in hass.data
 
     with patch(
-        "homeassistant.components.matter_autobind.manager.MatterBindingManager.async_setup",
+        "homeassistant.components.matter_autobind.logic.manager.MatterBindingManager.async_setup",
         new_callable=AsyncMock,
     ):
         assert await hass.config_entries.async_setup(mock_config_entry.entry_id)

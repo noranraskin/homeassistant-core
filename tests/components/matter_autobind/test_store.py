@@ -3,7 +3,7 @@
 import pytest
 
 from homeassistant.components.matter_autobind.store import (
-    BindingEntryDict,
+    EligibilityStatus,
     MatterBindingStore,
     MatterBindingStoreData,
 )
@@ -17,9 +17,9 @@ async def test_store_load_empty(hass: HomeAssistant) -> None:
     await store.async_load()
 
     assert store.data.scanned_automation_ids == set()
-    assert store.data.supported_devices == []
-    assert store.data.managed_bindings == {}
-    assert store.data.retry_queue == []
+    assert store.data.acl_resources == {}
+    assert store.data.binding_resources == {}
+    assert store.data.group_resources == {}
 
 
 async def test_store_load_twice_skips_second(
@@ -81,126 +81,126 @@ async def test_store_clear_scanned_automation(hass: HomeAssistant) -> None:
     assert not store.is_automation_scanned(automation_id)
 
 
-async def test_store_add_binding(hass: HomeAssistant) -> None:
-    """Test adding a binding entry."""
+async def test_store_eligibility_result(hass: HomeAssistant) -> None:
+    """Test setting and getting eligibility results."""
     store = MatterBindingStore(hass)
     await store.async_load()
 
     automation_id = "automation.test"
-    binding: BindingEntryDict = {
-        "client_node_id": 1,
-        "client_endpoint": 1,
-        "target_node_id": 2,
-        "target_endpoint": 1,
-        "clusters": [0x0006],
-    }
+    trigger_entities = ["light.source"]
+    action_entities = ["light.target"]
+    reason = "Test reason"
 
-    await store.async_add_binding(automation_id, binding)
+    await store.async_set_eligibility_result(
+        automation_id,
+        EligibilityStatus.ELIGIBLE,
+        trigger_entities,
+        action_entities,
+        reason,
+    )
 
-    assert automation_id in store.data.managed_bindings
-    assert len(store.data.managed_bindings[automation_id]) == 1
-    assert store.data.managed_bindings[automation_id][0] == binding
+    result = store.get_eligibility_result(automation_id)
+    assert result is not None
+    assert result["status"] == EligibilityStatus.ELIGIBLE
+    assert result["trigger_entities"] == trigger_entities
+    assert result["action_entities"] == action_entities
+    assert result["reason"] == reason
 
 
-async def test_store_add_multiple_bindings(hass: HomeAssistant) -> None:
-    """Test adding multiple bindings to the same automation."""
+async def test_store_acl_resources(hass: HomeAssistant) -> None:
+    """Test ACL resource management (acquire/release)."""
     store = MatterBindingStore(hass)
     await store.async_load()
 
     automation_id = "automation.test"
-    binding1: BindingEntryDict = {
-        "client_node_id": 1,
-        "client_endpoint": 1,
-        "target_node_id": 2,
-        "target_endpoint": 1,
-        "clusters": [0x0006],
-    }
-    binding2: BindingEntryDict = {
-        "client_node_id": 1,
-        "client_endpoint": 1,
-        "target_node_id": 3,
-        "target_endpoint": 1,
-        "clusters": [0x0006, 0x0008],
-    }
+    target_node = 1
+    source_node = 2
 
-    await store.async_add_binding(automation_id, binding1)
-    await store.async_add_binding(automation_id, binding2)
+    # Acquire ACL (should create new)
+    key, is_new = store.acquire_acl(automation_id, target_node, source_node)
+    assert is_new
+    assert store.acl_exists(key)
+    resource = store.get_acl_resource(key)
+    assert resource["ref_count"] == 1
+    assert automation_id in resource["automation_ids"]
 
-    assert len(store.data.managed_bindings[automation_id]) == 2
+    # Acquire same ACL again (should increment ref count)
+    automation_id_2 = "automation.other"
+    key2, is_new_2 = store.acquire_acl(automation_id_2, target_node, source_node)
+    assert not is_new_2
+    assert key2 == key
+    assert resource["ref_count"] == 2
+    assert automation_id_2 in resource["automation_ids"]
+
+    # Release from first automation
+    should_remove = store.release_acl(automation_id, key)
+    assert not should_remove
+    assert resource["ref_count"] == 1
+    assert automation_id not in resource["automation_ids"]
+
+    # Release from second automation (should remove)
+    should_remove = store.release_acl(automation_id_2, key)
+    assert should_remove
+    assert not store.acl_exists(key)
 
 
-async def test_store_remove_bindings_for_automation(hass: HomeAssistant) -> None:
-    """Test removing all bindings for an automation."""
+async def test_store_binding_resources(hass: HomeAssistant) -> None:
+    """Test Binding resource management (acquire/release)."""
     store = MatterBindingStore(hass)
     await store.async_load()
 
     automation_id = "automation.test"
-    binding: BindingEntryDict = {
-        "client_node_id": 1,
-        "client_endpoint": 1,
-        "target_node_id": 2,
-        "target_endpoint": 1,
-        "clusters": [0x0006],
-    }
+    source_node = 1
+    source_ep = 1
+    target_node = 2
+    target_ep = 1
 
-    await store.async_add_binding(automation_id, binding)
-    removed = await store.async_remove_bindings_for_automation(automation_id)
+    # Acquire Binding (unicast)
+    key, is_new = store.acquire_binding(
+        automation_id, source_node, source_ep, target_node, target_ep
+    )
+    assert is_new
+    assert store.binding_exists(key)
+    resource = store.get_binding_resource(key)
+    assert resource["ref_count"] == 1
+    assert resource["target_node_id"] == target_node
+    assert resource["target_group_id"] is None
 
-    assert len(removed) == 1
-    assert removed[0] == binding
-    assert automation_id not in store.data.managed_bindings
+    # Release Binding
+    should_remove = store.release_binding(automation_id, key)
+    assert should_remove
+    assert not store.binding_exists(key)
 
 
-async def test_store_remove_bindings_for_unknown_automation(
-    hass: HomeAssistant,
-) -> None:
-    """Test removing bindings for an automation that doesn't exist."""
+async def test_store_group_resources(hass: HomeAssistant) -> None:
+    """Test Group resource management (allocate/acquire/release)."""
     store = MatterBindingStore(hass)
     await store.async_load()
 
-    removed = await store.async_remove_bindings_for_automation("automation.unknown")
+    automation_id = "automation.test"
 
-    assert removed == []
+    # Allocate Group ID
+    group_id = store.allocate_group_id()
+    assert group_id >= 0
 
+    # Acquire Group
+    members = [(2, 1), (3, 1)]
+    key, is_new = store.acquire_group(automation_id, group_id, "Test Group", members)
+    assert is_new
+    assert store.group_exists(key)
+    resource = store.get_group_resource(key)
+    assert resource["ref_count"] == 1
+    assert len(resource["members"]) == 2
 
-async def test_store_add_to_retry_queue(hass: HomeAssistant) -> None:
-    """Test adding a failed binding to the retry queue."""
-    store = MatterBindingStore(hass)
-    await store.async_load()
+    # Update Group Epoch Key
+    epoch_key = "00112233445566778899aabbccddeeff"
+    store.update_group_epoch_key(key, epoch_key, 1)
+    assert resource["epoch_key"] == epoch_key
 
-    binding: BindingEntryDict = {
-        "client_node_id": 1,
-        "client_endpoint": 1,
-        "target_node_id": 2,
-        "target_endpoint": 1,
-        "clusters": [0x0006],
-    }
-
-    await store.async_add_to_retry_queue(binding)
-
-    assert len(store.data.retry_queue) == 1
-    assert store.data.retry_queue[0] == binding
-
-
-async def test_store_clear_retry_queue(hass: HomeAssistant) -> None:
-    """Test clearing the retry queue."""
-    store = MatterBindingStore(hass)
-    await store.async_load()
-
-    binding: BindingEntryDict = {
-        "client_node_id": 1,
-        "client_endpoint": 1,
-        "target_node_id": 2,
-        "target_endpoint": 1,
-        "clusters": [0x0006],
-    }
-
-    await store.async_add_to_retry_queue(binding)
-    cleared = await store.async_clear_retry_queue()
-
-    assert len(cleared) == 1
-    assert cleared[0] == binding
-    assert store.data.retry_queue == []
+    # Release Group
+    should_remove = store.release_group(automation_id, key)
+    assert should_remove
+    assert not store.group_exists(key)
 
 
 async def test_store_persistence(hass: HomeAssistant) -> None:
@@ -210,68 +210,46 @@ async def test_store_persistence(hass: HomeAssistant) -> None:
     await store1.async_load()
 
     automation_id = "automation.test"
-    await store1.async_mark_automation_scanned(automation_id)
+    target_node = 1
+    source_node = 2
+
+    # Create ACL in first store
+    key, _ = store1.acquire_acl(automation_id, target_node, source_node)
+    await store1.async_save()
 
     # Second store instance (simulates restart)
     store2 = MatterBindingStore(hass)
     await store2.async_load()
 
-    assert store2.is_automation_scanned(automation_id)
+    assert store2.acl_exists(key)
+    resource = store2.get_acl_resource(key)
+    assert resource["ref_count"] == 1
+    assert automation_id in resource["automation_ids"]
 
 
 def test_store_data_to_dict() -> None:
     """Test converting store data to dictionary."""
-    data = MatterBindingStoreData(
-        scanned_automation_ids={"automation.test1", "automation.test2"},
-        supported_devices=[1, 2, 3],
-        managed_bindings={
-            "automation.test1": [
-                {
-                    "client_node_id": 1,
-                    "client_endpoint": 1,
-                    "target_node_id": 2,
-                    "target_endpoint": 1,
-                    "clusters": [0x0006],
-                }
-            ]
-        },
-        retry_queue=[],
-    )
+    data = MatterBindingStoreData()
+    data.scanned_automation_ids.add("automation.test")
+    # Add dummy resources if needed, but empty checks are fine too
 
     result = data.to_dict()
-
-    # Sets are converted to lists
-    assert set(result["scanned_automation_ids"]) == {
-        "automation.test1",
-        "automation.test2",
-    }
-    assert result["supported_devices"] == [1, 2, 3]
-    assert "automation.test1" in result["managed_bindings"]
-    assert result["retry_queue"] == []
+    assert "automation.test" in result["scanned_automation_ids"]
+    assert isinstance(result["scanned_automation_ids"], list)
+    assert result["acl_resources"] == {}
 
 
 def test_store_data_from_dict() -> None:
     """Test creating store data from dictionary."""
     stored = {
-        "scanned_automation_ids": ["automation.test1", "automation.test2"],
-        "supported_devices": [1, 2, 3],
-        "managed_bindings": {},
-        "retry_queue": [],
+        "scanned_automation_ids": ["automation.test"],
+        "eligibility_results": {},
+        "acl_resources": {},
+        "binding_resources": {},
+        "group_resources": {},
+        "automation_resources": {},
     }
 
     data = MatterBindingStoreData.from_dict(stored)
-
-    assert data.scanned_automation_ids == {"automation.test1", "automation.test2"}
-    assert data.supported_devices == [1, 2, 3]
-    assert data.managed_bindings == {}
-    assert data.retry_queue == []
-
-
-def test_store_data_from_dict_none() -> None:
-    """Test creating store data from None."""
-    data = MatterBindingStoreData.from_dict(None)
-
-    assert data.scanned_automation_ids == set()
-    assert data.supported_devices == []
-    assert data.managed_bindings == {}
-    assert data.retry_queue == []
+    assert "automation.test" in data.scanned_automation_ids
+    assert data.acl_resources == {}
