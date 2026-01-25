@@ -1354,3 +1354,341 @@ class MatterBindingManager:
 
         LOGGER.debug("Current bindings on node %d: %s", node_id, current_bindings)
         return current_bindings, binding_path
+
+    # =========================================================================
+    # Dashboard API Methods
+    # =========================================================================
+
+    async def get_dashboard_data(self) -> list[dict[str, Any]]:
+        """Get dashboard data for all automations.
+
+        Returns a list of automation summaries for the panel UI.
+        """
+        automations: list[dict[str, Any]] = []
+        automation_states = self._hass.states.async_entity_ids(AUTOMATION_DOMAIN)
+
+        for automation_id in automation_states:
+            # Get eligibility result from store
+            eligibility = self._store.get_eligibility_result(automation_id)
+            resources = self._store.get_automation_resources(automation_id)
+
+            # Get the friendly name from state
+            state = self._hass.states.get(automation_id)
+            friendly_name = (
+                state.attributes.get("friendly_name", automation_id)
+                if state
+                else automation_id
+            )
+
+            # Determine binding status
+            if eligibility is None:
+                binding_status = "not_scanned"
+                status_reason = "Automation has not been analyzed yet"
+            elif eligibility["status"] != EligibilityStatus.ELIGIBLE:
+                binding_status = "ineligible"
+                status_reason = eligibility["reason"]
+            elif resources and (resources["binding_keys"] or resources["group_keys"]):
+                binding_status = "bound"
+                status_reason = "Bindings active"
+            else:
+                binding_status = "eligible"
+                status_reason = "Ready to bind"
+
+            # Determine binding mode
+            binding_mode = "none"
+            if resources:
+                if resources["group_keys"]:
+                    binding_mode = "group"
+                elif resources["binding_keys"]:
+                    binding_mode = "unicast"
+
+            automations.append(
+                {
+                    "automation_id": automation_id,
+                    "friendly_name": friendly_name,
+                    "is_enabled": state.state == "on" if state else False,
+                    "binding_status": binding_status,
+                    "status_reason": status_reason,
+                    "binding_mode": binding_mode,
+                    "trigger_count": len(eligibility["trigger_entities"])
+                    if eligibility
+                    else 0,
+                    "action_count": len(eligibility["action_entities"])
+                    if eligibility
+                    else 0,
+                }
+            )
+
+        return automations
+
+    async def get_automation_detail(self, automation_id: str) -> dict[str, Any]:
+        """Get detailed information about a specific automation.
+
+        Args:
+            automation_id: The automation entity_id.
+
+        Returns:
+            Detailed automation info including devices and resources.
+        """
+        eligibility = self._store.get_eligibility_result(automation_id)
+        resources = self._store.get_automation_resources(automation_id)
+        state = self._hass.states.get(automation_id)
+
+        result: dict[str, Any] = {
+            "automation_id": automation_id,
+            "friendly_name": (
+                state.attributes.get("friendly_name", automation_id)
+                if state
+                else automation_id
+            ),
+            "is_enabled": state.state == "on" if state else False,
+            "eligibility": eligibility,
+            "trigger_devices": [],
+            "action_devices": [],
+            "acls": [],
+            "bindings": [],
+            "groups": [],
+        }
+
+        # Get trigger device details
+        if eligibility:
+            for entity_id in eligibility["trigger_entities"]:
+                device_info = await self._get_device_info_for_entity(entity_id)
+                if device_info:
+                    result["trigger_devices"].append(device_info)
+
+            for entity_id in eligibility["action_entities"]:
+                device_info = await self._get_device_info_for_entity(entity_id)
+                if device_info:
+                    result["action_devices"].append(device_info)
+
+        # Get resource details
+        if resources:
+            for acl_key in resources["acl_keys"]:
+                acl_resource = self._store.get_acl_resource(acl_key)
+                if acl_resource:
+                    result["acls"].append(
+                        {
+                            "key": acl_key,
+                            "target_node_id": acl_resource["target_node_id"],
+                            "source_node_id": acl_resource["source_node_id"],
+                            "ref_count": acl_resource["ref_count"],
+                        }
+                    )
+
+            for binding_key in resources["binding_keys"]:
+                binding_resource = self._store.get_binding_resource(binding_key)
+                if binding_resource:
+                    result["bindings"].append(
+                        {
+                            "key": binding_key,
+                            "source_node_id": binding_resource["source_node_id"],
+                            "source_endpoint": binding_resource["source_endpoint"],
+                            "target_node_id": binding_resource["target_node_id"],
+                            "target_group_id": binding_resource["target_group_id"],
+                            "target_endpoint": binding_resource["target_endpoint"],
+                            "ref_count": binding_resource["ref_count"],
+                        }
+                    )
+
+            for group_key in resources["group_keys"]:
+                group_resource = self._store.get_group_resource(group_key)
+                if group_resource:
+                    result["groups"].append(
+                        {
+                            "key": group_key,
+                            "group_id": group_resource["group_id"],
+                            "group_name": group_resource["group_name"],
+                            "member_count": len(group_resource["members"]),
+                            "source_count": len(group_resource["source_nodes"]),
+                            "ref_count": group_resource["ref_count"],
+                        }
+                    )
+
+        return result
+
+    async def _get_device_info_for_entity(
+        self, entity_id: str
+    ) -> dict[str, Any] | None:
+        """Get device information for an entity."""
+        if self._entity_registry is None or self._device_registry is None:
+            return None
+
+        entity_entry = self._entity_registry.async_get(entity_id)
+        if entity_entry is None or entity_entry.device_id is None:
+            return None
+
+        device = self._device_registry.async_get(entity_entry.device_id)
+        if device is None:
+            return None
+
+        node = get_node_from_device_entry(self._hass, device)
+        node_id = node.node_id if node else None
+
+        return {
+            "entity_id": entity_id,
+            "device_id": entity_entry.device_id,
+            "device_name": device.name_by_user or device.name or "Unknown",
+            "node_id": node_id,
+        }
+
+    async def set_binding_preference(self, automation_id: str, preference: str) -> None:
+        """Set the binding strategy preference for an automation.
+
+        Args:
+            automation_id: The automation entity_id.
+            preference: One of "group", "unicast", or "auto".
+        """
+        LOGGER.info(
+            "Setting binding preference for %s to %s", automation_id, preference
+        )
+        # Store the preference (you may want to add this to the store)
+        # For now, trigger a reconciliation which will apply the current strategy
+        await self.force_reconcile_automation(automation_id)
+
+    async def get_node_raw_data(self, node_id: int) -> dict[str, Any]:
+        """Get raw Matter cluster data from a node.
+
+        Args:
+            node_id: The Matter node ID.
+
+        Returns:
+            Dict with acls, bindings, groups, and group_key_map data.
+        """
+        result: dict[str, Any] = {
+            "node_id": node_id,
+            "acls": None,
+            "bindings": None,
+            "groups": None,
+            "group_key_map": None,
+            "errors": [],
+        }
+
+        # Read ACL cluster (endpoint 0, cluster 31, attribute 0)
+        acl_data = await self._adapter.read_attribute(node_id, "0/31/0")
+        if acl_data is not None:
+            result["acls"] = self._serialize_cluster_data(acl_data)
+        else:
+            result["errors"].append("Failed to read ACL cluster")
+
+        # Read Binding cluster - try endpoint 1 first, then 0
+        for endpoint in (1, 0):
+            binding_data = await self._adapter.read_attribute(
+                node_id, f"{endpoint}/30/0"
+            )
+            if binding_data is not None:
+                result["bindings"] = {
+                    "endpoint": endpoint,
+                    "data": self._serialize_cluster_data(binding_data),
+                }
+                break
+        else:
+            result["errors"].append("Failed to read Binding cluster")
+
+        # Read Groups cluster (endpoint 1, cluster 4)
+        groups_data = await self._adapter.read_attribute(node_id, "1/4/0")
+        if groups_data is not None:
+            result["groups"] = self._serialize_cluster_data(groups_data)
+
+        # Read GroupKeyManagement cluster (endpoint 0, cluster 63, attribute 1)
+        gkm_data = await self._adapter.read_attribute(node_id, "0/63/1")
+        if gkm_data is not None:
+            result["group_key_map"] = self._serialize_cluster_data(gkm_data)
+
+        return result
+
+    def _serialize_cluster_data(self, data: Any) -> Any:
+        """Serialize cluster data to JSON-safe format."""
+        if data is None:
+            return None
+        if isinstance(data, list):
+            return [self._serialize_cluster_data(item) for item in data]
+        if isinstance(data, dict):
+            return {str(k): self._serialize_cluster_data(v) for k, v in data.items()}
+        if hasattr(data, "__dict__"):
+            # Convert chip cluster objects to dicts
+            return {k: self._serialize_cluster_data(v) for k, v in vars(data).items()}
+        # Basic types (int, str, bool, etc.)
+        return data
+
+    async def delete_resource(
+        self,
+        node_id: int,
+        resource_type: str,
+        resource_data: dict[str, Any],
+    ) -> bool:
+        """Delete a specific resource from a device.
+
+        Args:
+            node_id: The Matter node ID.
+            resource_type: One of "acl", "binding", "group", "group_key_map".
+            resource_data: Resource-specific data identifying what to delete.
+
+        Returns:
+            True if deletion succeeded.
+        """
+        LOGGER.warning(
+            "Manual resource deletion requested: node=%d, type=%s, data=%s",
+            node_id,
+            resource_type,
+            resource_data,
+        )
+
+        try:
+            if resource_type == "acl":
+                # Need to implement ACL removal by index
+                return await self._adapter.remove_acl(
+                    node_id, resource_data.get("index", 0)
+                )
+            if resource_type == "binding":
+                endpoint = resource_data.get("endpoint", 1)
+                target_node_id = resource_data.get("target_node_id")
+                if target_node_id is None:
+                    LOGGER.error("Target_node_id is required for binding deletion")
+                    return False
+                return await self._adapter.remove_binding(
+                    node_id,
+                    endpoint,
+                    target_node_id,
+                    resource_data.get("target_endpoint", 1),
+                )
+            if resource_type == "group":
+                # Would need to implement group removal
+                LOGGER.warning("Group deletion not yet implemented")
+                return False
+            if resource_type == "group_key_map":
+                # Would need to implement group key map removal
+                LOGGER.warning("GroupKeyMap deletion not yet implemented")
+                return False
+            LOGGER.error("Unknown resource type: %s", resource_type)
+        except Exception as err:  # noqa: BLE001
+            LOGGER.error("Failed to delete resource: %s", err)
+            return False
+        else:
+            return False
+
+    async def force_reconcile_automation(self, automation_id: str) -> None:
+        """Force re-analysis and reconciliation of a single automation.
+
+        Args:
+            automation_id: The automation entity_id.
+        """
+        LOGGER.info("Force reconciling automation: %s", automation_id)
+
+        # Clear the scanned status to force re-analysis
+        await self._store.async_clear_scanned_automation(automation_id)
+
+        # Re-check and process
+        await self._async_check_and_log_automation(automation_id, is_new=False)
+
+    async def force_reconcile_all(self) -> None:
+        """Force re-analysis and reconciliation of all automations."""
+        LOGGER.info("Force reconciling all automations")
+
+        # Clear all scanned statuses
+        automation_states = self._hass.states.async_entity_ids(AUTOMATION_DOMAIN)
+        for automation_id in automation_states:
+            await self._store.async_clear_scanned_automation(automation_id)
+
+        # Re-scan all
+        await self.async_scan_automations()

@@ -16,6 +16,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
 
+from .api import async_register_websocket_commands
 from .const import (
     DOMAIN,
     FRONTEND_URL_BASE,
@@ -78,6 +79,9 @@ async def async_setup_entry(
     # Forward platform setup (so callbacks are registered)
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
+    # Register WebSocket API commands
+    async_register_websocket_commands(hass)
+
     # Register Web Panel
     await _async_register_panel(hass)
 
@@ -116,7 +120,6 @@ async def _async_register_panel(hass: HomeAssistant) -> None:
         module_url=f"{FRONTEND_URL_BASE}/matter-autobind-panel.js",
         embed_iframe=False,
         require_admin=True,
-        config_panel_domain=DOMAIN,
     )
 
     LOGGER.info("Matter AutoBind panel registered at /%s", PANEL_URL_PATH)
