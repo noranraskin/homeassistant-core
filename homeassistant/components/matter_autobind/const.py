@@ -19,6 +19,25 @@ STORAGE_VERSION: Final = 1
 CONF_ENABLE_GROUP_BINDINGS: Final = "enable_group_bindings"
 
 # =============================================================================
+# Web Panel Configuration
+# =============================================================================
+PANEL_URL_PATH: Final = "matter-autobind"
+PANEL_TITLE: Final = "Matter AutoBind"
+PANEL_ICON: Final = "mdi:link-variant"
+FRONTEND_URL_BASE: Final = f"/{DOMAIN}/frontend"
+
+# WebSocket command types
+WS_TYPE_GET_DASHBOARD_DATA: Final = f"{DOMAIN}/get_dashboard_data"
+WS_TYPE_GET_AUTOMATION_DETAIL: Final = f"{DOMAIN}/get_automation_detail"
+WS_TYPE_SET_BINDING_PREFERENCE: Final = f"{DOMAIN}/set_binding_preference"
+WS_TYPE_GET_NODE_RAW_DATA: Final = f"{DOMAIN}/get_node_raw_data"
+WS_TYPE_DELETE_RESOURCE: Final = f"{DOMAIN}/delete_resource"
+WS_TYPE_FORCE_RECONCILE: Final = f"{DOMAIN}/force_reconcile"
+
+# Configuration options (for config_flow.py)
+CONF_ENABLE_DEBUG_PANEL: Final = "enable_debug_panel"
+
+# =============================================================================
 # Matter Cluster IDs
 # =============================================================================
 # Re-export commonly used cluster IDs from cluster_map for convenience.
@@ -52,14 +71,25 @@ __all__ = [
     "CLUSTER_ID_ON_OFF",
     "CLUSTER_ID_THERMOSTAT",
     "CLUSTER_ID_WINDOW_COVERING",
+    "CONF_ENABLE_DEBUG_PANEL",
     "CONF_ENABLE_GROUP_BINDINGS",
     "DEBUG_OVERWRITE_ACLS",
     "DEBUG_RESET_STORE",
     "DOMAIN",
     "EVENT_AUTOMATION_RELOADED",
+    "FRONTEND_URL_BASE",
     "LOGGER",
+    "PANEL_ICON",
+    "PANEL_TITLE",
+    "PANEL_URL_PATH",
     "STORAGE_KEY",
     "STORAGE_VERSION",
+    "WS_TYPE_DELETE_RESOURCE",
+    "WS_TYPE_FORCE_RECONCILE",
+    "WS_TYPE_GET_AUTOMATION_DETAIL",
+    "WS_TYPE_GET_DASHBOARD_DATA",
+    "WS_TYPE_GET_NODE_RAW_DATA",
+    "WS_TYPE_SET_BINDING_PREFERENCE",
 ]
 
 # Group ID allocation range
