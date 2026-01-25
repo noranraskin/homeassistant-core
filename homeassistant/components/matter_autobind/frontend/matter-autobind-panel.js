@@ -55,6 +55,15 @@ class MatterAutoBindPanel extends HTMLElement {
           break;
       }
     });
+
+    // Handle preference dropdown changes
+    this.shadowRoot.addEventListener("change", (e) => {
+      if (e.target.id === "binding-preference") {
+        const automationId = e.target.dataset.automationId;
+        const preference = e.target.value;
+        this._setBindingPreference(automationId, preference);
+      }
+    });
   }
 
   _toggleAutomationDetail(automationId) {
@@ -118,6 +127,22 @@ class MatterAutoBindPanel extends HTMLElement {
       }
     } catch (err) {
       alert("Reconcile failed: " + err.message);
+    }
+  }
+
+  async _setBindingPreference(automationId, preference) {
+    try {
+      await this._callService("matter_autobind/set_binding_preference", {
+        automation_id: automationId,
+        preference: preference,
+      });
+      // Refresh data after preference change (reconciliation happens automatically)
+      await this._loadDashboardData();
+      if (this._selectedAutomation === automationId) {
+        await this._loadAutomationDetail(automationId);
+      }
+    } catch (err) {
+      alert("Failed to set binding preference: " + err.message);
     }
   }
 
@@ -242,9 +267,20 @@ class MatterAutoBindPanel extends HTMLElement {
         .detail-title {
           font-size: 18px;
           font-weight: 500;
-          margin-bottom: 16px;
+        }
+        .preference-selector {
+          display: flex;
+          align-items: center;
+        }
+        .preference-selector select {
+          cursor: pointer;
+        }
+        .preference-selector select:focus {
+          outline: 2px solid var(--primary-color);
+          outline-offset: 1px;
         }
         .detail-section {
+          margin-top: 16px;
           margin-bottom: 16px;
         }
         .detail-section-title {
@@ -411,13 +447,35 @@ class MatterAutoBindPanel extends HTMLElement {
     }
 
     const detail = this._automationDetail;
+    // Build preference options from available_preferences
+    const availablePrefs = detail.available_preferences || [
+      { value: "auto", label: "Auto" },
+      { value: "unicast", label: "Unicast" },
+    ];
+    const preferenceOptions = availablePrefs
+      .map(
+        (pref) =>
+          `<option value="${pref.value}" ${detail.binding_preference === pref.value ? "selected" : ""}>${this._escapeHtml(pref.label)}</option>`,
+      )
+      .join("");
+
     let html = `
       <div class="detail-panel">
-        <div style="display: flex; justify-content: space-between; align-items: center;">
+        <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px;">
           <div class="detail-title">${this._escapeHtml(detail.friendly_name)}</div>
-          <button class="btn btn-secondary" data-action="reconcile-single" data-automation-id="${detail.automation_id}">
-            ⚡ Reconcile
-          </button>
+          <div style="display: flex; align-items: center; gap: 12px;">
+            <div class="preference-selector">
+              <label for="binding-preference" style="margin-right: 8px; font-size: 14px;">Binding Mode:</label>
+              <select id="binding-preference" 
+                      data-automation-id="${detail.automation_id}"
+                      style="padding: 6px 10px; border-radius: 4px; border: 1px solid var(--divider-color); background: var(--card-background-color); color: var(--primary-text-color);">
+                ${preferenceOptions}
+              </select>
+            </div>
+            <button class="btn btn-secondary" data-action="reconcile-single" data-automation-id="${detail.automation_id}">
+              ⚡ Reconcile
+            </button>
+          </div>
         </div>
     `;
 

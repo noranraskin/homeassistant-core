@@ -253,3 +253,61 @@ def test_store_data_from_dict() -> None:
     data = MatterBindingStoreData.from_dict(stored)
     assert "automation.test" in data.scanned_automation_ids
     assert data.acl_resources == {}
+
+
+async def test_store_binding_preference(hass: HomeAssistant) -> None:
+    """Test setting and getting binding preferences."""
+    store = MatterBindingStore(hass)
+    await store.async_load()
+
+    automation_id = "automation.test"
+
+    # Initially no preference
+    assert store.get_binding_preference(automation_id) is None
+
+    # Set to unicast
+    await store.async_set_binding_preference(automation_id, "unicast")
+    assert store.get_binding_preference(automation_id) == "unicast"
+
+    # Set to group
+    await store.async_set_binding_preference(automation_id, "group")
+    assert store.get_binding_preference(automation_id) == "group"
+
+    # Set to auto (removes preference)
+    await store.async_set_binding_preference(automation_id, "auto")
+    assert store.get_binding_preference(automation_id) is None
+
+    # Set back and then clear with None
+    await store.async_set_binding_preference(automation_id, "unicast")
+    await store.async_set_binding_preference(automation_id, None)
+    assert store.get_binding_preference(automation_id) is None
+
+
+async def test_store_binding_preference_persistence(hass: HomeAssistant) -> None:
+    """Test that binding preferences persist across store instances."""
+    # First store instance
+    store1 = MatterBindingStore(hass)
+    await store1.async_load()
+
+    automation_id = "automation.test"
+    await store1.async_set_binding_preference(automation_id, "group")
+    await store1.async_save()
+
+    # Second store instance (simulates restart)
+    store2 = MatterBindingStore(hass)
+    await store2.async_load()
+
+    assert store2.get_binding_preference(automation_id) == "group"
+
+
+def test_store_data_binding_preferences_serialization() -> None:
+    """Test that binding preferences are serialized correctly."""
+    data = MatterBindingStoreData()
+    data.binding_preferences["automation.test"] = "unicast"
+
+    result = data.to_dict()
+    assert result["binding_preferences"] == {"automation.test": "unicast"}
+
+    # Test from_dict
+    restored = MatterBindingStoreData.from_dict(result)
+    assert restored.binding_preferences == {"automation.test": "unicast"}

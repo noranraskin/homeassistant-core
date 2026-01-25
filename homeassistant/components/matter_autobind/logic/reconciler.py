@@ -98,6 +98,7 @@ class ResourceReconciler:
         trigger_nodes: list[NodeInfo],
         action_nodes: list[NodeInfo],
         existing_group_id: int | None = None,
+        automation_id: str | None = None,
     ) -> DesiredResourceState:
         """Compute what resources SHOULD exist for this automation.
 
@@ -105,6 +106,7 @@ class ResourceReconciler:
             trigger_nodes: List of trigger node info.
             action_nodes: List of action node info.
             existing_group_id: Reuse existing group ID if available.
+            automation_id: Optional automation ID for preference lookup.
 
         Returns:
             DesiredResourceState with all required resources.
@@ -114,13 +116,60 @@ class ResourceReconciler:
         groups: set[tuple[int, frozenset[tuple[int, int]]]] = set()
         group_id: int | None = None
 
-        # Check if group bindings are enabled
+        # Check if group bindings are enabled globally
         enable_groups = self._config_entry.options.get(
             CONF_ENABLE_GROUP_BINDINGS, False
         )
 
-        # Decide binding strategy based on target count and group setting
-        use_groups = len(action_nodes) > 1 and enable_groups
+        # Check per-automation preference
+        preference: str | None = None
+        if automation_id:
+            preference = self._store.get_binding_preference(automation_id)
+
+        # Handle "none" preference - disable bindings completely
+        if preference == "none":
+            self._logger.info(
+                "Automation %s: bindings disabled (explicit preference)",
+                automation_id,
+            )
+            return DesiredResourceState(
+                acls=acls,
+                bindings=bindings,
+                groups=groups,
+                group_id=None,
+            )
+
+        # Decide binding strategy
+        # Priority: 1) Per-automation preference, 2) Global setting + target count
+        if preference == "unicast":
+            use_groups = False
+            self._logger.debug(
+                "Automation %s: using unicast (explicit preference)",
+                automation_id,
+            )
+        elif preference == "group":
+            if not enable_groups:
+                self._logger.warning(
+                    "Automation %s prefers groups but groups are disabled globally",
+                    automation_id,
+                )
+                use_groups = False
+            else:
+                use_groups = True
+                self._logger.debug(
+                    "Automation %s: using groups (explicit preference)",
+                    automation_id,
+                )
+        else:
+            # Auto-detect: use groups if >1 target AND groups enabled
+            use_groups = len(action_nodes) > 1 and enable_groups
+            self._logger.debug(
+                "Automation %s: auto-detected %s (targets=%d, groups_enabled=%s)",
+                automation_id,
+                "groups" if use_groups else "unicast",
+                len(action_nodes),
+                enable_groups,
+            )
 
         if not use_groups:
             # Unicast bindings: each source -> each target

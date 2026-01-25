@@ -133,7 +133,7 @@ async def ws_get_automation_detail(
     {
         vol.Required("type"): WS_TYPE_SET_BINDING_PREFERENCE,
         vol.Required("automation_id"): cv.string,
-        vol.Required("preference"): vol.In(["group", "unicast", "auto"]),
+        vol.Required("preference"): vol.In(["group", "unicast", "auto", "none"]),
     }
 )
 @websocket_api.async_response

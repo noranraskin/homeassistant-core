@@ -104,3 +104,159 @@ async def test_reconcile_acls_remove_old(
 
     # Verify store no longer has the ACL
     assert not store.acl_exists(key)
+
+
+async def test_compute_desired_state_unicast_preference(
+    hass: HomeAssistant, store: MatterBindingStore
+) -> None:
+    """Test that unicast preference forces unicast even with multiple targets."""
+    await store.async_load()
+
+    # Set unicast preference
+    await store.async_set_binding_preference("automation.test", "unicast")
+
+    # Create reconciler with groups enabled
+    config_entry = MagicMock()
+    config_entry.options = {"enable_group_bindings": True}
+
+    adapter = MagicMock()
+    group_manager = MagicMock()
+    logger = MagicMock()
+
+    reconciler = ResourceReconciler(
+        hass, config_entry, store, adapter, group_manager, logger
+    )
+
+    source_nodes = [NodeInfo(entity_id="switch.source", node_id=1, endpoint_id=1)]
+    target_nodes = [
+        NodeInfo(entity_id="light.target1", node_id=2, endpoint_id=1),
+        NodeInfo(entity_id="light.target2", node_id=3, endpoint_id=1),
+    ]
+
+    # With unicast preference, should create unicast bindings even with 2 targets
+    desired = reconciler.compute_desired_state(
+        source_nodes, target_nodes, automation_id="automation.test"
+    )
+
+    # Should have 2 ACLs (one for each target, CASE mode)
+    assert len(desired.acls) == 2
+    assert (2, 1, 2) in desired.acls  # target 2 grants source 1
+    assert (3, 1, 2) in desired.acls  # target 3 grants source 1
+
+    # Should have 2 unicast bindings (not group)
+    assert len(desired.bindings) == 2
+    assert (1, 1, 2, 1) in desired.bindings  # source -> target 2
+    assert (1, 1, 3, 1) in desired.bindings  # source -> target 3
+
+    # No groups
+    assert not desired.groups
+
+
+async def test_compute_desired_state_group_preference(
+    hass: HomeAssistant, store: MatterBindingStore
+) -> None:
+    """Test that group preference creates groups when enabled."""
+    await store.async_load()
+
+    # Set group preference
+    await store.async_set_binding_preference("automation.test", "group")
+
+    # Create reconciler with groups enabled
+    config_entry = MagicMock()
+    config_entry.options = {"enable_group_bindings": True}
+
+    adapter = MagicMock()
+    group_manager = MagicMock()
+    logger = MagicMock()
+
+    reconciler = ResourceReconciler(
+        hass, config_entry, store, adapter, group_manager, logger
+    )
+
+    source_nodes = [NodeInfo(entity_id="switch.source", node_id=1, endpoint_id=1)]
+    target_nodes = [
+        NodeInfo(entity_id="light.target1", node_id=2, endpoint_id=1),
+        NodeInfo(entity_id="light.target2", node_id=3, endpoint_id=1),
+    ]
+
+    desired = reconciler.compute_desired_state(
+        source_nodes, target_nodes, automation_id="automation.test"
+    )
+
+    # Should have groups (one binding to group)
+    assert len(desired.groups) == 1
+
+    # Check the group binding exists
+    group_bindings = [b for b in desired.bindings if isinstance(b[2], str)]
+    assert len(group_bindings) == 1
+
+
+async def test_compute_desired_state_auto_detection(
+    hass: HomeAssistant, store: MatterBindingStore
+) -> None:
+    """Test auto-detection without preference set."""
+    await store.async_load()
+
+    # No preference set, auto mode
+    config_entry = MagicMock()
+    config_entry.options = {"enable_group_bindings": True}
+
+    adapter = MagicMock()
+    group_manager = MagicMock()
+    logger = MagicMock()
+
+    reconciler = ResourceReconciler(
+        hass, config_entry, store, adapter, group_manager, logger
+    )
+
+    source_nodes = [NodeInfo(entity_id="switch.source", node_id=1, endpoint_id=1)]
+    target_nodes = [
+        NodeInfo(entity_id="light.target1", node_id=2, endpoint_id=1),
+        NodeInfo(entity_id="light.target2", node_id=3, endpoint_id=1),
+    ]
+
+    # With auto mode and multiple targets + groups enabled, should use groups
+    desired = reconciler.compute_desired_state(
+        source_nodes, target_nodes, automation_id="automation.test"
+    )
+
+    # Should have groups
+    assert len(desired.groups) == 1
+
+
+async def test_compute_desired_state_none_preference(
+    hass: HomeAssistant, store: MatterBindingStore
+) -> None:
+    """Test that none preference disables bindings entirely."""
+    await store.async_load()
+
+    # Set none preference
+    await store.async_set_binding_preference("automation.test", "none")
+
+    config_entry = MagicMock()
+    config_entry.options = {"enable_group_bindings": True}
+
+    adapter = MagicMock()
+    group_manager = MagicMock()
+    logger = MagicMock()
+
+    reconciler = ResourceReconciler(
+        hass, config_entry, store, adapter, group_manager, logger
+    )
+
+    source_nodes = [NodeInfo(entity_id="switch.source", node_id=1, endpoint_id=1)]
+    target_nodes = [
+        NodeInfo(entity_id="light.target1", node_id=2, endpoint_id=1),
+        NodeInfo(entity_id="light.target2", node_id=3, endpoint_id=1),
+    ]
+
+    # With none preference, should return empty state
+    desired = reconciler.compute_desired_state(
+        source_nodes, target_nodes, automation_id="automation.test"
+    )
+
+    # All should be empty - bindings are disabled
+    assert len(desired.acls) == 0
+    assert len(desired.bindings) == 0
+    assert len(desired.groups) == 0
+    assert desired.group_id is None

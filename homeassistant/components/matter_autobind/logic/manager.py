@@ -1260,10 +1260,10 @@ class MatterBindingManager:
         # Get current state
         current = self._reconciler.get_current_resource_state(automation_id)
 
-        # Compute desired state
+        # Compute desired state (passing automation_id for preference lookup)
         existing_group_id = self._store.get_existing_group_id(automation_id)
         desired = self._reconciler.compute_desired_state(
-            trigger_nodes, action_nodes, existing_group_id
+            trigger_nodes, action_nodes, existing_group_id, automation_id
         )
 
         LOGGER.debug(
@@ -1402,6 +1402,9 @@ class MatterBindingManager:
                 elif resources["binding_keys"]:
                     binding_mode = "unicast"
 
+            # Get binding preference
+            preference = self._store.get_binding_preference(automation_id) or "auto"
+
             automations.append(
                 {
                     "automation_id": automation_id,
@@ -1410,6 +1413,7 @@ class MatterBindingManager:
                     "binding_status": binding_status,
                     "status_reason": status_reason,
                     "binding_mode": binding_mode,
+                    "binding_preference": preference,
                     "trigger_count": len(eligibility["trigger_entities"])
                     if eligibility
                     else 0,
@@ -1433,6 +1437,12 @@ class MatterBindingManager:
         eligibility = self._store.get_eligibility_result(automation_id)
         resources = self._store.get_automation_resources(automation_id)
         state = self._hass.states.get(automation_id)
+        preference = self._store.get_binding_preference(automation_id) or "auto"
+
+        # Determine which preference options are available
+        available_preferences = await self._get_available_preferences(
+            eligibility, automation_id
+        )
 
         result: dict[str, Any] = {
             "automation_id": automation_id,
@@ -1443,6 +1453,8 @@ class MatterBindingManager:
             ),
             "is_enabled": state.state == "on" if state else False,
             "eligibility": eligibility,
+            "binding_preference": preference,
+            "available_preferences": available_preferences,
             "trigger_devices": [],
             "action_devices": [],
             "acls": [],
@@ -1532,18 +1544,97 @@ class MatterBindingManager:
             "node_id": node_id,
         }
 
+    async def _get_available_preferences(
+        self,
+        eligibility: Any | None,
+        automation_id: str,
+    ) -> list[dict[str, str]]:
+        """Get the list of available binding preference options for an automation.
+
+        The available options depend on:
+        - Whether groups are enabled globally
+        - Number of action targets (group requires 2+)
+        - Whether the trigger entity is a virtual client-cluster-only entity
+
+        Args:
+            eligibility: The eligibility result for the automation.
+            automation_id: The automation entity_id.
+
+        Returns:
+            List of dicts with 'value' and 'label' for each available option.
+        """
+        options: list[dict[str, str]] = []
+
+        # Check if groups are enabled globally
+        enable_groups = self._config_entry.options.get("enable_group_bindings", False)
+
+        # Check number of action targets
+        action_count = len(eligibility["action_entities"]) if eligibility else 0
+
+        # Check if trigger entity is a virtual entity (created by this integration)
+        is_virtual_trigger = False
+        if eligibility and eligibility["trigger_entities"]:
+            for trigger_entity_id in eligibility["trigger_entities"]:
+                if self._is_virtual_entity(trigger_entity_id):
+                    is_virtual_trigger = True
+                    break
+
+        # Always add "auto" option
+        options.append({"value": "auto", "label": "Auto"})
+
+        # Always add "unicast" option
+        options.append({"value": "unicast", "label": "Unicast"})
+
+        # Only add "group" if groups are enabled AND there are 2+ targets
+        if enable_groups and action_count >= 2:
+            options.append({"value": "group", "label": "Group"})
+
+        # Only add "none" if the trigger is NOT a virtual entity
+        # Virtual entities (client-cluster-only) can't really trigger automations
+        # independently, so disabling bindings doesn't make sense for them
+        if not is_virtual_trigger:
+            options.append({"value": "none", "label": "None (disabled)"})
+
+        return options
+
+    def _is_virtual_entity(self, entity_id: str) -> bool:
+        """Check if an entity is a virtual entity created by this integration.
+
+        Virtual entities are client-cluster-only entities created by matter_autobind.
+        They represent the client side of Matter switches and don't have server
+        clusters, so they cannot be controlled directly.
+
+        Args:
+            entity_id: The entity_id to check.
+
+        Returns:
+            True if the entity belongs to the matter_autobind domain.
+        """
+        if self._entity_registry is None:
+            return False
+
+        entity_entry = self._entity_registry.async_get(entity_id)
+        if entity_entry is None:
+            return False
+
+        # Check if the entity belongs to this integration's domain
+        return entity_entry.platform == DOMAIN
+
     async def set_binding_preference(self, automation_id: str, preference: str) -> None:
         """Set the binding strategy preference for an automation.
 
         Args:
             automation_id: The automation entity_id.
-            preference: One of "group", "unicast", or "auto".
+            preference: One of "group", "unicast", "auto", or "none".
         """
         LOGGER.info(
             "Setting binding preference for %s to %s", automation_id, preference
         )
-        # Store the preference (you may want to add this to the store)
-        # For now, trigger a reconciliation which will apply the current strategy
+
+        # Store the preference
+        await self._store.async_set_binding_preference(automation_id, preference)
+
+        # Trigger a reconciliation to apply the new strategy
         await self.force_reconcile_automation(automation_id)
 
     async def get_node_raw_data(self, node_id: int) -> dict[str, Any]:

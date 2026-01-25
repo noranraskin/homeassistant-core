@@ -242,6 +242,9 @@ class StoredDataDict(TypedDict, total=False):
     # New: Automation → Resources mapping
     automation_resources: dict[str, AutomationResourcesDict]
 
+    # Per-automation binding preferences
+    binding_preferences: dict[str, str]
+
 
 # =============================================================================
 # Data Classes
@@ -273,6 +276,9 @@ class MatterBindingStoreData:
     )
     """Map of automation_id -> resources used by that automation."""
 
+    binding_preferences: dict[str, str] = field(default_factory=dict)
+    """Map of automation_id -> binding preference ('group', 'unicast', or 'auto')."""
+
     def to_dict(self) -> StoredDataDict:
         """Convert dataclass to a dictionary for storage."""
         return StoredDataDict(
@@ -282,6 +288,7 @@ class MatterBindingStoreData:
             binding_resources=self.binding_resources,
             group_resources=self.group_resources,
             automation_resources=self.automation_resources,
+            binding_preferences=self.binding_preferences,
         )
 
     @classmethod
@@ -297,6 +304,7 @@ class MatterBindingStoreData:
             binding_resources=data.get("binding_resources", {}),
             group_resources=data.get("group_resources", {}),
             automation_resources=data.get("automation_resources", {}),
+            binding_preferences=data.get("binding_preferences", {}),
         )
 
 
@@ -342,12 +350,12 @@ class MatterBindingStore:
 
         # Check for debug reset flag BEFORE loading
         if DEBUG_RESET_STORE:
-            LOGGER.warning("⚠️ DEBUG_RESET_STORE is enabled! Wiping all store data...")
+            LOGGER.warning("⚠️ DEBUG_RESET_STORE is enabled! Wiping all store data")
             self._data = MatterBindingStoreData()
             self._loaded = True
             await self.async_save()
             LOGGER.warning(
-                "⚠️ Store has been reset. Set DEBUG_RESET_STORE=False and restart."
+                "⚠️ Store has been reset. Set DEBUG_RESET_STORE=False and restart"
             )
             return
 
@@ -446,6 +454,46 @@ class MatterBindingStore:
             await self.async_save()
 
     # =========================================================================
+    # Binding Preferences
+    # =========================================================================
+
+    def get_binding_preference(self, automation_id: str) -> str | None:
+        """Get the binding preference for an automation.
+
+        Args:
+            automation_id: The automation entity ID.
+
+        Returns:
+            'group', 'unicast', or None (meaning auto-detect).
+        """
+        return self._data.binding_preferences.get(automation_id)
+
+    async def async_set_binding_preference(
+        self, automation_id: str, preference: str | None
+    ) -> None:
+        """Set the binding preference for an automation.
+
+        Args:
+            automation_id: The automation entity ID.
+            preference: 'group', 'unicast', 'auto', or None to remove preference.
+        """
+        if preference is None or preference == "auto":
+            # Remove preference to use auto-detection
+            self._data.binding_preferences.pop(automation_id, None)
+            LOGGER.debug(
+                "Cleared binding preference for %s (using auto-detect)",
+                automation_id,
+            )
+        else:
+            self._data.binding_preferences[automation_id] = preference
+            LOGGER.debug(
+                "Set binding preference for %s to %s",
+                automation_id,
+                preference,
+            )
+        await self.async_save()
+
+    # =========================================================================
     # Group ID Allocation
     # =========================================================================
 
@@ -458,10 +506,7 @@ class MatterBindingStore:
         Raises:
             RuntimeError: If no group IDs are available.
         """
-        used_ids = {
-            self._data.group_resources[key]["group_id"]
-            for key in self._data.group_resources
-        }
+        used_ids = {m["group_id"] for m in self._data.group_resources.values()}
         for gid in range(AUTOBIND_GROUP_ID_START, AUTOBIND_GROUP_ID_MAX + 1):
             if gid not in used_ids:
                 return gid
