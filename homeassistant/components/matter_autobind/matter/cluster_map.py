@@ -1,13 +1,13 @@
 """Service to Matter Cluster mapping for Matter AutoBind.
 
-This module provides a lookup table (LUT) class for mapping Home Assistant
+This module provides lookup functions for mapping Home Assistant
 services to Matter Cluster IDs. This is essential for determining which
 clusters need to be bound when creating Matter bindings.
 
 Example:
-    from .matter.cluster_map import ClusterMap
+    from .matter.cluster_map import get_clusters_for_service
 
-    clusters = ClusterMap.get_clusters_for_service("light.turn_on")
+    clusters = get_clusters_for_service("light.turn_on")
     # Returns: [6, 8, 768] (OnOff, LevelControl, ColorControl)
 """
 
@@ -192,149 +192,113 @@ _SERVICE_TO_CLUSTER_MAP: Final[dict[str, list[int]]] = {
 }
 
 
-class ClusterMap:
-    """Lookup table for Service-to-Cluster mappings.
-
-    Provides methods to lookup which Matter clusters are needed for
-    Home Assistant service calls. This is used when creating bindings
-    to determine which clusters the source device needs to have in its
-    binding to control the target device.
-
-    Example:
-        # Get all clusters needed for light.turn_on
-        clusters = ClusterMap.get_clusters_for_service("light.turn_on")
-        # Returns [6, 8, 768]  (OnOff, LevelControl, ColorControl)
-
-        # Get just the primary cluster for the service
-        primary = ClusterMap.get_primary_cluster("light.turn_on")
-        # Returns 6  (OnOff)
-    """
-
-    @staticmethod
-    def get_clusters_for_service(service: str) -> list[int] | None:
-        """Get all Matter cluster IDs required for a service call.
-
-        Args:
-            service: The service call in 'domain.service' format
-                     (e.g., 'light.turn_on', 'switch.toggle')
-
-        Returns:
-            List of cluster IDs required for this service, or None if
-            the service is not mapped. The first cluster in the list
-            is typically the PRIMARY cluster for the service.
-        """
-        return _SERVICE_TO_CLUSTER_MAP.get(service)
-
-    @staticmethod
-    def get_primary_cluster(service: str) -> int | None:
-        """Get the primary Matter cluster ID for a service call.
-
-        The primary cluster is the main cluster used for the service.
-        For example, 'light.turn_on' primarily uses OnOff (0x0006).
-
-        Args:
-            service: The service call in 'domain.service' format.
-
-        Returns:
-            The primary cluster ID, or None if the service is not mapped.
-        """
-        clusters = _SERVICE_TO_CLUSTER_MAP.get(service)
-        return clusters[0] if clusters else None
-
-    @staticmethod
-    def is_service_supported(service: str) -> bool:
-        """Check if a service call is supported for Matter binding.
-
-        Args:
-            service: The service call in 'domain.service' format.
-
-        Returns:
-            True if the service can be mapped to Matter clusters.
-        """
-        return service in _SERVICE_TO_CLUSTER_MAP
-
-    @staticmethod
-    def get_all_supported_services() -> list[str]:
-        """Get all service calls that can be mapped to Matter clusters.
-
-        Returns:
-            List of all supported service names in 'domain.service' format.
-        """
-        return list(_SERVICE_TO_CLUSTER_MAP.keys())
-
-    @staticmethod
-    def get_services_for_cluster(cluster_id: int) -> list[str]:
-        """Get all services that use a specific cluster.
-
-        This is useful for determining what services a device with
-        a particular cluster can support.
-
-        Args:
-            cluster_id: The Matter cluster ID to look up.
-
-        Returns:
-            List of service names that use this cluster.
-        """
-        services = []
-        for service, clusters in _SERVICE_TO_CLUSTER_MAP.items():
-            if cluster_id in clusters:
-                services.append(service)
-        return services
-
-    @staticmethod
-    def get_clusters_for_device_capabilities(
-        service: str,
-        available_clusters: set[int],
-    ) -> list[int]:
-        """Get clusters for a service, filtered by device capabilities.
-
-        This handles edge cases where a device might not have all
-        clusters that a service could use. For example, 'light.turn_on'
-        maps to OnOff, LevelControl, and ColorControl, but a simple
-        OnOff light only has the OnOff cluster.
-
-        Args:
-            service: The service call in 'domain.service' format.
-            available_clusters: Set of cluster IDs the device supports.
-
-        Returns:
-            List of cluster IDs the device has that are relevant to
-            the service. Returns empty list if service not supported
-            or device has none of the required clusters.
-        """
-        required = _SERVICE_TO_CLUSTER_MAP.get(service)
-        if not required:
-            return []
-
-        # Return clusters that both the service needs AND the device has
-        return [c for c in required if c in available_clusters]
-
-
 # =============================================================================
-# Module-level convenience functions
+# Module-level functions
 # =============================================================================
-# These provide a simpler functional interface to the ClusterMap class
 
 
 def get_clusters_for_service(service: str) -> list[int] | None:
     """Get all Matter cluster IDs required for a service call.
 
-    See ClusterMap.get_clusters_for_service for details.
+    Args:
+        service: The service call in 'domain.service' format
+                 (e.g., 'light.turn_on', 'switch.toggle')
+
+    Returns:
+        List of cluster IDs required for this service, or None if
+        the service is not mapped. The first cluster in the list
+        is typically the PRIMARY cluster for the service.
+
+    Example:
+        clusters = get_clusters_for_service("light.turn_on")
+        # Returns [6, 8, 768]  (OnOff, LevelControl, ColorControl)
     """
-    return ClusterMap.get_clusters_for_service(service)
+    return _SERVICE_TO_CLUSTER_MAP.get(service)
 
 
 def get_primary_cluster(service: str) -> int | None:
     """Get the primary Matter cluster ID for a service call.
 
-    See ClusterMap.get_primary_cluster for details.
+    The primary cluster is the main cluster used for the service.
+    For example, 'light.turn_on' primarily uses OnOff (0x0006).
+
+    Args:
+        service: The service call in 'domain.service' format.
+
+    Returns:
+        The primary cluster ID, or None if the service is not mapped.
+
+    Example:
+        primary = get_primary_cluster("light.turn_on")
+        # Returns 6  (OnOff)
     """
-    return ClusterMap.get_primary_cluster(service)
+    clusters = _SERVICE_TO_CLUSTER_MAP.get(service)
+    return clusters[0] if clusters else None
 
 
 def is_service_supported(service: str) -> bool:
     """Check if a service call is supported for Matter binding.
 
-    See ClusterMap.is_service_supported for details.
+    Args:
+        service: The service call in 'domain.service' format.
+
+    Returns:
+        True if the service can be mapped to Matter clusters.
     """
-    return ClusterMap.is_service_supported(service)
+    return service in _SERVICE_TO_CLUSTER_MAP
+
+
+def get_all_supported_services() -> list[str]:
+    """Get all service calls that can be mapped to Matter clusters.
+
+    Returns:
+        List of all supported service names in 'domain.service' format.
+    """
+    return list(_SERVICE_TO_CLUSTER_MAP.keys())
+
+
+def get_services_for_cluster(cluster_id: int) -> list[str]:
+    """Get all services that use a specific cluster.
+
+    This is useful for determining what services a device with
+    a particular cluster can support.
+
+    Args:
+        cluster_id: The Matter cluster ID to look up.
+
+    Returns:
+        List of service names that use this cluster.
+    """
+    return [
+        service
+        for service, clusters in _SERVICE_TO_CLUSTER_MAP.items()
+        if cluster_id in clusters
+    ]
+
+
+def get_clusters_for_device_capabilities(
+    service: str,
+    available_clusters: set[int],
+) -> list[int]:
+    """Get clusters for a service, filtered by device capabilities.
+
+    This handles edge cases where a device might not have all
+    clusters that a service could use. For example, 'light.turn_on'
+    maps to OnOff, LevelControl, and ColorControl, but a simple
+    OnOff light only has the OnOff cluster.
+
+    Args:
+        service: The service call in 'domain.service' format.
+        available_clusters: Set of cluster IDs the device supports.
+
+    Returns:
+        List of cluster IDs the device has that are relevant to
+        the service. Returns empty list if service not supported
+        or device has none of the required clusters.
+    """
+    required = _SERVICE_TO_CLUSTER_MAP.get(service)
+    if not required:
+        return []
+
+    # Return clusters that both the service needs AND the device has
+    return [c for c in required if c in available_clusters]

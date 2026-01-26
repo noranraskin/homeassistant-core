@@ -5,12 +5,12 @@ logic for interacting with Matter devices.
 
 Submodules:
 - adapter: Wrapper around Matter client for read/write/command operations
-- cluster_map: Service-to-cluster mapping lookup table
+- cluster_map: Service-to-cluster mapping lookup functions
 - models: Matter-specific dataclasses
 """
 
 from .adapter import MatterAdapter
-from .cluster_map import ClusterMap, get_clusters_for_service, get_primary_cluster
+from .cluster_map import get_clusters_for_service, get_primary_cluster
 from .models import (
     AclEntry,
     BindingTarget,
@@ -24,7 +24,6 @@ from .models import (
 __all__ = [
     "AclEntry",
     "BindingTarget",
-    "ClusterMap",
     "GroupInfo",
     "GroupMember",
     "GroupTarget",
