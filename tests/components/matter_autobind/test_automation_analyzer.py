@@ -95,7 +95,10 @@ async def test_analyze_automation_with_empty_conditions(
             "homeassistant.components.matter_autobind.automation.analyzer.DATA_COMPONENT",
             "automation",
         ),
-        patch.object(analyzer, "_is_matter_entity", return_value=True),
+        patch(
+            "homeassistant.components.matter_autobind.automation.analyzer.is_matter_entity",
+            return_value=True,
+        ),
     ):
         hass.data["automation"] = MagicMock()
         hass.data["automation"].get_entity.return_value = mock_automation
@@ -137,7 +140,10 @@ async def test_analyze_eligible_automation(
             "homeassistant.components.matter_autobind.automation.analyzer.DATA_COMPONENT",
             "automation",
         ),
-        patch.object(analyzer, "_is_matter_entity", return_value=True),
+        patch(
+            "homeassistant.components.matter_autobind.automation.analyzer.is_matter_entity",
+            return_value=True,
+        ),
     ):
         hass.data["automation"] = MagicMock()
         hass.data["automation"].get_entity.return_value = mock_automation

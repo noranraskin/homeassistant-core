@@ -19,6 +19,7 @@ from homeassistant.const import CONF_DEVICE_ID, CONF_ENTITY_ID, CONF_PLATFORM
 from homeassistant.exceptions import HomeAssistantError
 
 from ..store import EligibilityStatus
+from ..utils import get_matter_entities_for_device, is_matter_entity
 from .models import ActionInfo, AutomationAnalysis, EligibilityReason, TriggerInfo
 
 if TYPE_CHECKING:
@@ -26,10 +27,6 @@ if TYPE_CHECKING:
     from homeassistant.helpers import device_registry as dr, entity_registry as er
 
 _LOGGER = logging.getLogger(__name__)
-
-# Domain constants
-MATTER_DOMAIN = "matter"
-AUTOBIND_DOMAIN = "matter_autobind"
 
 
 class AutomationAnalyzer:
@@ -204,7 +201,9 @@ class AutomationAnalyzer:
         # Convert device IDs to entities - collect existing entity_ids first
         existing_entity_ids = {t.entity_id for t in triggers}
         for device_id in trigger_device_ids:
-            device_entities = self._get_matter_entities_for_device(device_id)
+            device_entities = get_matter_entities_for_device(
+                device_id, self._entity_registry
+            )
             triggers.extend(
                 self._build_trigger_info(entity_id, "device")
                 for entity_id in device_entities
@@ -248,7 +247,9 @@ class AutomationAnalyzer:
         # Convert device IDs to entities
         existing_entity_ids = {a.entity_id for a in actions}
         for device_id in action_device_ids:
-            device_entities = self._get_matter_entities_for_device(device_id)
+            device_entities = get_matter_entities_for_device(
+                device_id, self._entity_registry
+            )
             actions.extend(
                 self._build_action_info(entity_id)
                 for entity_id in device_entities
@@ -268,7 +269,7 @@ class AutomationAnalyzer:
         Returns:
             TriggerInfo with Matter information filled in.
         """
-        is_matter = self._is_matter_entity(entity_id)
+        is_matter = is_matter_entity(entity_id, self._entity_registry)
         node_id = None
         endpoint_id = None
 
@@ -293,7 +294,7 @@ class AutomationAnalyzer:
         Returns:
             ActionInfo with Matter information filled in.
         """
-        is_matter = self._is_matter_entity(entity_id)
+        is_matter = is_matter_entity(entity_id, self._entity_registry)
         node_id = None
         endpoint_id = None
 
@@ -377,37 +378,6 @@ class AutomationAnalyzer:
         analysis.eligible = True
         analysis.reason = EligibilityReason.ELIGIBLE
         analysis.reason_detail = "Automation is eligible for Matter binding"
-
-    def _is_matter_entity(self, entity_id: str) -> bool:
-        """Check if an entity belongs to the Matter or Matter AutoBind integration.
-
-        Args:
-            entity_id: The entity_id to check.
-
-        Returns:
-            True if the entity is from the Matter or Matter AutoBind integration.
-        """
-        entity_entry = self._entity_registry.async_get(entity_id)
-        if entity_entry is None:
-            return False
-
-        return entity_entry.platform in (MATTER_DOMAIN, AUTOBIND_DOMAIN)
-
-    def _get_matter_entities_for_device(self, device_id: str) -> list[str]:
-        """Get all Matter entities for a device.
-
-        Args:
-            device_id: The device_id to look up.
-
-        Returns:
-            List of Matter entity_ids for the device.
-        """
-        return [
-            entry.entity_id
-            for entry in self._entity_registry.entities.values()
-            if entry.device_id == device_id
-            and entry.platform in (MATTER_DOMAIN, AUTOBIND_DOMAIN)
-        ]
 
     async def get_referenced_entities(self, automation_id: str) -> list[str]:
         """Get all entities referenced by an automation.

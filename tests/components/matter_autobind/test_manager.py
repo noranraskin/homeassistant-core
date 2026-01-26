@@ -6,6 +6,7 @@ import pytest
 
 from homeassistant.components.matter_autobind.logic.manager import MatterBindingManager
 from homeassistant.components.matter_autobind.store import MatterBindingStore
+from homeassistant.components.matter_autobind.utils import is_matter_entity
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import entity_registry as er
 
@@ -126,7 +127,7 @@ async def test_is_matter_entity_returns_true_for_matter(
     manager: MatterBindingManager,
     entity_registry: er.EntityRegistry,
 ) -> None:
-    """Test _is_matter_entity correctly identifies Matter entities."""
+    """Test is_matter_entity utility correctly identifies Matter entities."""
     # Create Matter entity
     matter_entry = entity_registry.async_get_or_create(
         domain="light",
@@ -136,7 +137,7 @@ async def test_is_matter_entity_returns_true_for_matter(
 
     await manager.async_setup()
 
-    assert manager._is_matter_entity(matter_entry.entity_id) is True
+    assert is_matter_entity(matter_entry.entity_id, entity_registry) is True
 
 
 async def test_is_matter_entity_returns_false_for_non_matter(
@@ -144,7 +145,7 @@ async def test_is_matter_entity_returns_false_for_non_matter(
     manager: MatterBindingManager,
     entity_registry: er.EntityRegistry,
 ) -> None:
-    """Test _is_matter_entity correctly rejects non-Matter entities."""
+    """Test is_matter_entity utility correctly rejects non-Matter entities."""
     # Create ZHA entity
     zha_entry = entity_registry.async_get_or_create(
         domain="light",
@@ -154,17 +155,18 @@ async def test_is_matter_entity_returns_false_for_non_matter(
 
     await manager.async_setup()
 
-    assert manager._is_matter_entity(zha_entry.entity_id) is False
+    assert is_matter_entity(zha_entry.entity_id, entity_registry) is False
 
 
 async def test_is_matter_entity_returns_false_for_unknown(
     hass: HomeAssistant,
     manager: MatterBindingManager,
+    entity_registry: er.EntityRegistry,
 ) -> None:
-    """Test _is_matter_entity returns False for unknown entities."""
+    """Test is_matter_entity utility returns False for unknown entities."""
     await manager.async_setup()
 
-    assert manager._is_matter_entity("light.nonexistent") is False
+    assert is_matter_entity("light.nonexistent", entity_registry) is False
 
 
 async def test_scan_automations_finds_matter_entities(

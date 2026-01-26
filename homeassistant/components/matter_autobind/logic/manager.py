@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 from typing import TYPE_CHECKING, Any
 
 from chip.clusters import Objects as Clusters
@@ -19,8 +18,7 @@ from homeassistant.core import (
     callback,
 )
 from homeassistant.exceptions import HomeAssistantError
-from homeassistant.helpers import device_registry as dr
-from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers import device_registry as dr, entity_registry as er
 from homeassistant.helpers.event import (
     async_track_state_added_domain,
     async_track_state_change_event,
@@ -41,37 +39,17 @@ from ..const import (
 from ..discovery import async_discover_client_cluster_entities
 from ..matter import MatterAdapter, StatefulSwitchInfo
 from ..store import EligibilityStatus, MatterBindingStore
+from ..utils import (
+    MATTER_DOMAIN,
+    get_matter,
+    get_node_from_device_entry,
+    get_node_id_from_device,
+    serialize_cluster_data,
+)
 from . import GroupManager, NodeInfo, ResourceReconciler
 
 if TYPE_CHECKING:
-    from homeassistant.components.matter.helpers import (  # pylint: disable=hass-component-root-import
-        get_matter as _get_matter,
-    )
-    from homeassistant.components.matter.helpers import (
-        get_node_from_device_entry as _get_node_from_device_entry,
-    )
     from homeassistant.config_entries import ConfigEntry
-else:
-    from homeassistant.components.matter.helpers import (  # pylint: disable=hass-component-root-import
-        get_matter as _get_matter,
-    )
-    from homeassistant.components.matter.helpers import (
-        get_node_from_device_entry as _get_node_from_device_entry,
-    )
-
-
-def get_matter(hass: HomeAssistant) -> Any:
-    """Wrapper for get_matter."""
-    return _get_matter(hass)
-
-
-def get_node_from_device_entry(hass: HomeAssistant, device_entry: Any) -> Any:
-    """Wrapper for get_node_from_device_entry."""
-    return _get_node_from_device_entry(hass, device_entry)
-
-
-# Matter domain constant
-MATTER_DOMAIN = "matter"
 
 
 class MatterBindingManager:
@@ -936,52 +914,6 @@ class MatterBindingManager:
         )
         return False
 
-    @callback
-    def _is_matter_entity(self, entity_id: str) -> bool:
-        """Check if an entity belongs to the Matter or Matter AutoBind integration.
-
-        Args:
-            entity_id: The entity_id to check.
-
-        Returns:
-        True if the entity is from the Matter or Matter AutoBind integration.
-        """
-
-        if self._entity_registry is None:
-            return False
-
-        entity_entry = self._entity_registry.async_get(entity_id)
-        if entity_entry is None:
-            return False
-
-        # Accept entities from both the official matter integration
-        # and our matter_autobind integration (for client cluster entities)
-        return entity_entry.platform in (MATTER_DOMAIN, DOMAIN)
-
-    @callback
-    def _get_matter_entities_for_device(self, device_id: str) -> list[str]:
-        """Get all Matter or Matter AutoBind entities for a device.
-
-        Args:
-            device_id: The device_id to check.
-
-        Returns:
-        List of Matter/Matter AutoBind entity_ids for the device.
-        """
-
-        if self._entity_registry is None:
-            return []
-
-        # Accept entities from both the official matter integration
-        # and our matter_autobind integration (for client cluster entities)
-        return [
-            entity.entity_id
-            for entity in er.async_entries_for_device(
-                self._entity_registry, device_id, include_disabled_entities=False
-            )
-            if entity.platform in (MATTER_DOMAIN, DOMAIN)
-        ]
-
     async def async_discover_client_clusters(self) -> None:
         """Discover Matter nodes with client clusters and create entities.
 
@@ -1193,7 +1125,7 @@ class MatterBindingManager:
                 continue
 
             # Find Matter node ID from device identifiers
-            node_id = self._get_node_id_from_device(device)
+            node_id = get_node_id_from_device(device)
 
             if node_id is not None:
                 # Default to endpoint 1 for most devices
@@ -1206,31 +1138,6 @@ class MatterBindingManager:
                 )
 
         return result
-
-    def _get_node_id_from_device(self, device: dr.DeviceEntry) -> int | None:
-        """Extract Matter node ID from device identifiers."""
-        node_id: int | None = None
-        for domain, identifier in device.identifiers:
-            if domain == MATTER_DOMAIN:
-                # Try to parse as simple integer first
-                if identifier.isdigit():
-                    return int(identifier)
-
-                with contextlib.suppress(ValueError):
-                    node_id = int(identifier)
-
-                # Try to parse "deviceid_FABRIC-NODEID-MatterNodeDevice" format
-                if node_id is None and identifier.startswith("deviceid_"):
-                    try:
-                        parts = identifier.split("-")
-                        if len(parts) >= 2:
-                            node_id = int(parts[1], 16)
-                    except (ValueError, IndexError):
-                        pass
-
-                if node_id is not None:
-                    return node_id
-        return None
 
     async def _reconcile_automation_resources(
         self,
@@ -1663,7 +1570,7 @@ class MatterBindingManager:
         # Read ACL cluster (endpoint 0, cluster 31, attribute 0)
         acl_data = await self._adapter.read_attribute(node_id, "0/31/0")
         if acl_data is not None:
-            result["acls"] = self._serialize_cluster_data(acl_data)
+            result["acls"] = serialize_cluster_data(acl_data)
         else:
             result["errors"].append("Failed to read ACL cluster")
 
@@ -1675,7 +1582,7 @@ class MatterBindingManager:
             if binding_data is not None:
                 result["bindings"] = {
                     "endpoint": endpoint,
-                    "data": self._serialize_cluster_data(binding_data),
+                    "data": serialize_cluster_data(binding_data),
                 }
                 break
         else:
@@ -1684,87 +1591,14 @@ class MatterBindingManager:
         # Read Groups cluster (endpoint 1, cluster 4)
         groups_data = await self._adapter.read_attribute(node_id, "1/4/0")
         if groups_data is not None:
-            result["groups"] = self._serialize_cluster_data(groups_data)
+            result["groups"] = serialize_cluster_data(groups_data)
 
         # Read GroupKeyManagement cluster (endpoint 0, cluster 63, attribute 1)
         gkm_data = await self._adapter.read_attribute(node_id, "0/63/1")
         if gkm_data is not None:
-            result["group_key_map"] = self._serialize_cluster_data(gkm_data)
+            result["group_key_map"] = serialize_cluster_data(gkm_data)
 
         return result
-
-    def _serialize_cluster_data(
-        self, data: Any, depth: int = 0, seen: set | None = None
-    ) -> Any:
-        """Serialize cluster data to JSON-safe format.
-
-        Args:
-            data: The data to serialize.
-            depth: Current recursion depth (to prevent infinite recursion).
-            seen: Set of object IDs already visited (to detect cycles).
-
-        Returns:
-            JSON-serializable representation of the data.
-        """
-        # Prevent infinite recursion
-        if depth > 10:
-            return f"<max depth exceeded: {type(data).__name__}>"
-
-        if seen is None:
-            seen = set()
-
-        if data is None:
-            return None
-
-        # Handle chip.clusters.Types.Nullable (Matter's null type)
-        type_name = type(data).__name__
-        if type_name == "Nullable" or "Null" in type_name:
-            return None
-
-        # Handle NullValue singleton
-        if str(data) == "Null" or repr(data).startswith("Null"):
-            return None
-
-        # Check for circular references using object id
-        obj_id = id(data)
-        if obj_id in seen:
-            return f"<circular ref: {type_name}>"
-        seen.add(obj_id)
-
-        try:
-            if isinstance(data, list):
-                return [
-                    self._serialize_cluster_data(item, depth + 1, seen) for item in data
-                ]
-            if isinstance(data, dict):
-                return {
-                    str(k): self._serialize_cluster_data(v, depth + 1, seen)
-                    for k, v in data.items()
-                }
-            if isinstance(data, (int, float, str, bool)):
-                return data
-            if isinstance(data, bytes):
-                return data.hex()
-            # Handle enums
-            if hasattr(data, "value") and hasattr(data, "name"):
-                return data.value
-            if hasattr(data, "__dict__"):
-                # Convert chip cluster objects to dicts
-                # Skip private attributes and known problematic ones
-                result = {}
-                for k, v in vars(data).items():
-                    # Skip private attributes and known circular reference fields
-                    if k.startswith("_"):
-                        continue
-                    if k in ("endpoint", "node", "parent", "cluster"):
-                        continue
-                    result[k] = self._serialize_cluster_data(v, depth + 1, seen)
-                return result
-            # For other types, convert to string
-            return str(data)
-        finally:
-            # Remove from seen set when done with this branch
-            seen.discard(obj_id)
 
     async def delete_resource(
         self,
@@ -2076,7 +1910,7 @@ class MatterBindingManager:
         for idx, acl_entry in enumerate(acl_data):
             entry: dict[str, Any] = {
                 "index": idx,
-                "raw": self._serialize_cluster_data(acl_entry),
+                "raw": serialize_cluster_data(acl_entry),
             }
 
             # Parse common ACL fields
@@ -2084,9 +1918,9 @@ class MatterBindingManager:
                 entry["privilege"] = self._get_privilege_name(acl_entry.get("1", 0))
                 entry["auth_mode"] = self._get_auth_mode_name(acl_entry.get("2", 0))
                 subjects = acl_entry.get("3", [])
-                entry["subjects"] = self._serialize_cluster_data(subjects) or []
+                entry["subjects"] = serialize_cluster_data(subjects) or []
                 targets = acl_entry.get("4", [])
-                entry["targets"] = self._serialize_cluster_data(targets) or []
+                entry["targets"] = serialize_cluster_data(targets) or []
             else:
                 # Chip cluster object
                 entry["privilege"] = self._get_privilege_name(
@@ -2096,9 +1930,9 @@ class MatterBindingManager:
                     getattr(acl_entry, "authMode", 0)
                 )
                 subjects = getattr(acl_entry, "subjects", [])
-                entry["subjects"] = self._serialize_cluster_data(subjects) or []
+                entry["subjects"] = serialize_cluster_data(subjects) or []
                 targets = getattr(acl_entry, "targets", [])
-                entry["targets"] = self._serialize_cluster_data(targets) or []
+                entry["targets"] = serialize_cluster_data(targets) or []
 
             parsed.append(entry)
 
@@ -2117,7 +1951,7 @@ class MatterBindingManager:
             entry: dict[str, Any] = {
                 "index": idx,
                 "endpoint": endpoint,
-                "raw": self._serialize_cluster_data(binding_entry),
+                "raw": serialize_cluster_data(binding_entry),
             }
 
             if isinstance(binding_entry, dict):
@@ -2155,7 +1989,7 @@ class MatterBindingManager:
         for idx, entry in enumerate(gkm_data):
             item: dict[str, Any] = {
                 "index": idx,
-                "raw": self._serialize_cluster_data(entry),
+                "raw": serialize_cluster_data(entry),
             }
 
             if isinstance(entry, dict):
@@ -2181,7 +2015,7 @@ class MatterBindingManager:
         for idx, entry in enumerate(group_table):
             item: dict[str, Any] = {
                 "index": idx,
-                "raw": self._serialize_cluster_data(entry),
+                "raw": serialize_cluster_data(entry),
             }
 
             if isinstance(entry, dict):
@@ -2213,7 +2047,7 @@ class MatterBindingManager:
     def _get_auth_mode_name(self, auth_mode: int) -> str:
         """Get human-readable authentication mode name."""
         modes = {
-            1: "PASE",  # noqa
+            1: "PASE",  # codespell:ignore
             2: "CASE",
             3: "Group",
         }
