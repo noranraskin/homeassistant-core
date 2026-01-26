@@ -7,6 +7,7 @@ It abstracts the low-level Matter protocol operations from the manager.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 import logging
 from typing import TYPE_CHECKING, Any
 
@@ -130,6 +131,79 @@ class MatterAdapter:
         except (KeyError, StopIteration) as err:
             raise RuntimeError("Matter integration not available") from err
         return matter.matter_client
+
+    async def _read_modify_write(
+        self,
+        node_id: int,
+        attribute_path: str,
+        modify_fn: Callable[[list[Any]], list[Any]],
+        verify: bool = True,
+        operation_name: str = "modify",
+    ) -> tuple[bool, list[Any]]:
+        """Read-modify-write helper for list attributes.
+
+        This encapsulates the common pattern of:
+        1. Read current list from attribute
+        2. Modify the list (filter, add, etc.)
+        3. Write updated list back
+        4. Optionally verify the write
+
+        Args:
+            node_id: The node to operate on.
+            attribute_path: The attribute path (e.g., "0/31/0").
+            modify_fn: Function that takes current list and returns modified list.
+            verify: Whether to verify the write succeeded.
+            operation_name: Name for logging (e.g., "ACL write", "binding remove").
+
+        Returns:
+            Tuple of (success, final_list) where final_list is the verified list
+            or the expected list if verify=False.
+        """
+        matter_client = self._get_matter_client()
+
+        # Read current
+        current_resp = await matter_client.read_attribute(node_id, attribute_path)
+        current_list = current_resp.get(attribute_path, [])
+        if not isinstance(current_list, list):
+            current_list = []
+
+        # Modify
+        updated_list = modify_fn(current_list)
+
+        # Skip write if no changes
+        if updated_list == current_list:
+            return True, current_list
+
+        # Write
+        await matter_client.write_attribute(
+            node_id=node_id,
+            attribute_path=attribute_path,
+            value=updated_list,
+        )
+
+        # Verify
+        if verify:
+            verify_resp = await matter_client.read_attribute(node_id, attribute_path)
+            verify_list = verify_resp.get(attribute_path, [])
+            # Check count matches (simple verification)
+            if len(verify_list) == len(updated_list):
+                self._logger.debug(
+                    "✓ %s verified on node %d: %d entries",
+                    operation_name,
+                    node_id,
+                    len(verify_list),
+                )
+                return True, verify_list
+            self._logger.error(
+                "✗ %s failed on node %d: expected %d entries, got %d",
+                operation_name,
+                node_id,
+                len(updated_list),
+                len(verify_list),
+            )
+            return False, verify_list
+
+        return True, updated_list
 
     # =========================================================================
     # ACL Operations
@@ -344,20 +418,16 @@ class MatterAdapter:
             True if removal succeeded, False otherwise.
         """
         try:
-            matter_client = self._get_matter_client()
+            self._get_matter_client()
         except RuntimeError:
             return False
 
         auth_mode_name = "GROUP" if auth_mode == 3 else "CASE"
 
-        try:
-            acl_path = "0/31/0"
-            current_acls = await matter_client.read_attribute(target_node_id, acl_path)
-            current_acl_list = current_acls.get(acl_path, [])
-
-            # Filter out entries matching subject AND auth_mode
-            updated_list = []
-            for acl_entry in current_acl_list:
+        def filter_acl(acl_list: list[Any]) -> list[Any]:
+            """Filter out entries matching subject AND auth_mode."""
+            result = []
+            for acl_entry in acl_list:
                 if isinstance(acl_entry, dict):
                     subjects = acl_entry.get("3", []) or []
                     entry_auth_mode = acl_entry.get("2", 0)
@@ -366,14 +436,18 @@ class MatterAdapter:
                     entry_auth_mode = getattr(acl_entry, "authMode", 0)
 
                 if subject not in subjects or entry_auth_mode != auth_mode:
-                    updated_list.append(acl_entry)
+                    result.append(acl_entry)
+            return result
 
-            if len(updated_list) < len(current_acl_list):
-                await matter_client.write_attribute(
-                    node_id=target_node_id,
-                    attribute_path=acl_path,
-                    value=updated_list,
-                )
+        try:
+            success, _ = await self._read_modify_write(
+                node_id=target_node_id,
+                attribute_path="0/31/0",
+                modify_fn=filter_acl,
+                verify=False,  # Remove doesn't need strict verification
+                operation_name=f"{auth_mode_name} ACL remove",
+            )
+            if success:
                 self._logger.info(
                     "Removed %s ACL from node %d for subject %d",
                     auth_mode_name,
@@ -385,7 +459,7 @@ class MatterAdapter:
             self._logger.error("Failed to remove ACL: %s", err)
             return False
         else:
-            return True  # Success or nothing to remove
+            return success
 
     # =========================================================================
     # Binding Operations
@@ -650,44 +724,41 @@ class MatterAdapter:
             True if removal succeeded, False otherwise.
         """
         try:
-            matter_client = self._get_matter_client()
+            self._get_matter_client()
         except RuntimeError:
             return False
 
+        is_group = isinstance(target, str) and target.startswith("g")
+        target_value = int(str(target)[1:]) if is_group else int(target)
+
+        def filter_binding(binding_list: list[Any]) -> list[Any]:
+            """Filter out entries matching target."""
+            result = []
+            for binding in binding_list:
+                if isinstance(binding, dict):
+                    if is_group:
+                        if binding.get("2") != target_value:
+                            result.append(binding)
+                    elif binding.get("1") != target_value:
+                        result.append(binding)
+                else:
+                    result.append(binding)
+            return result
+
         try:
-            # Determine correct endpoint for binding
             binding_endpoint = self._get_binding_endpoint(
                 source_node_id, source_endpoint
             )
             binding_path = f"{binding_endpoint}/30/0"
-            current_bindings_resp = await matter_client.read_attribute(
-                source_node_id, binding_path
+
+            success, _ = await self._read_modify_write(
+                node_id=source_node_id,
+                attribute_path=binding_path,
+                modify_fn=filter_binding,
+                verify=False,
+                operation_name="binding remove",
             )
-            current_bindings = current_bindings_resp.get(binding_path, [])
-
-            if not isinstance(current_bindings, list):
-                return True  # Nothing to remove
-
-            is_group = isinstance(target, str) and target.startswith("g")
-            target_value = int(str(target)[1:]) if is_group else int(target)
-
-            updated_bindings = []
-            for binding in current_bindings:
-                if isinstance(binding, dict):
-                    if is_group:
-                        if binding.get("2") != target_value:
-                            updated_bindings.append(binding)
-                    elif binding.get("1") != target_value:
-                        updated_bindings.append(binding)
-                else:
-                    updated_bindings.append(binding)
-
-            if len(updated_bindings) < len(current_bindings):
-                await matter_client.write_attribute(
-                    node_id=source_node_id,
-                    attribute_path=binding_path,
-                    value=updated_bindings,
-                )
+            if success:
                 self._logger.info(
                     "Removed binding from node %d to %s", source_node_id, target
                 )
@@ -696,7 +767,7 @@ class MatterAdapter:
             self._logger.error("Failed to remove binding: %s", err)
             return False
         else:
-            return True  # Success or nothing to remove
+            return success
 
     # =========================================================================
     # Read Operations
