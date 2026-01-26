@@ -19,7 +19,8 @@ from homeassistant.core import (
     callback,
 )
 from homeassistant.exceptions import HomeAssistantError
-from homeassistant.helpers import device_registry as dr, entity_registry as er
+from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.event import (
     async_track_state_added_domain,
     async_track_state_change_event,
@@ -45,12 +46,16 @@ from . import GroupManager, NodeInfo, ResourceReconciler
 if TYPE_CHECKING:
     from homeassistant.components.matter.helpers import (  # pylint: disable=hass-component-root-import
         get_matter as _get_matter,
+    )
+    from homeassistant.components.matter.helpers import (
         get_node_from_device_entry as _get_node_from_device_entry,
     )
     from homeassistant.config_entries import ConfigEntry
 else:
     from homeassistant.components.matter.helpers import (  # pylint: disable=hass-component-root-import
         get_matter as _get_matter,
+    )
+    from homeassistant.components.matter.helpers import (
         get_node_from_device_entry as _get_node_from_device_entry,
     )
 
@@ -1688,19 +1693,78 @@ class MatterBindingManager:
 
         return result
 
-    def _serialize_cluster_data(self, data: Any) -> Any:
-        """Serialize cluster data to JSON-safe format."""
+    def _serialize_cluster_data(
+        self, data: Any, depth: int = 0, seen: set | None = None
+    ) -> Any:
+        """Serialize cluster data to JSON-safe format.
+
+        Args:
+            data: The data to serialize.
+            depth: Current recursion depth (to prevent infinite recursion).
+            seen: Set of object IDs already visited (to detect cycles).
+
+        Returns:
+            JSON-serializable representation of the data.
+        """
+        # Prevent infinite recursion
+        if depth > 10:
+            return f"<max depth exceeded: {type(data).__name__}>"
+
+        if seen is None:
+            seen = set()
+
         if data is None:
             return None
-        if isinstance(data, list):
-            return [self._serialize_cluster_data(item) for item in data]
-        if isinstance(data, dict):
-            return {str(k): self._serialize_cluster_data(v) for k, v in data.items()}
-        if hasattr(data, "__dict__"):
-            # Convert chip cluster objects to dicts
-            return {k: self._serialize_cluster_data(v) for k, v in vars(data).items()}
-        # Basic types (int, str, bool, etc.)
-        return data
+
+        # Handle chip.clusters.Types.Nullable (Matter's null type)
+        type_name = type(data).__name__
+        if type_name == "Nullable" or "Null" in type_name:
+            return None
+
+        # Handle NullValue singleton
+        if str(data) == "Null" or repr(data).startswith("Null"):
+            return None
+
+        # Check for circular references using object id
+        obj_id = id(data)
+        if obj_id in seen:
+            return f"<circular ref: {type_name}>"
+        seen.add(obj_id)
+
+        try:
+            if isinstance(data, list):
+                return [
+                    self._serialize_cluster_data(item, depth + 1, seen) for item in data
+                ]
+            if isinstance(data, dict):
+                return {
+                    str(k): self._serialize_cluster_data(v, depth + 1, seen)
+                    for k, v in data.items()
+                }
+            if isinstance(data, (int, float, str, bool)):
+                return data
+            if isinstance(data, bytes):
+                return data.hex()
+            # Handle enums
+            if hasattr(data, "value") and hasattr(data, "name"):
+                return data.value
+            if hasattr(data, "__dict__"):
+                # Convert chip cluster objects to dicts
+                # Skip private attributes and known problematic ones
+                result = {}
+                for k, v in vars(data).items():
+                    # Skip private attributes and known circular reference fields
+                    if k.startswith("_"):
+                        continue
+                    if k in ("endpoint", "node", "parent", "cluster"):
+                        continue
+                    result[k] = self._serialize_cluster_data(v, depth + 1, seen)
+                return result
+            # For other types, convert to string
+            return str(data)
+        finally:
+            # Remove from seen set when done with this branch
+            seen.discard(obj_id)
 
     async def delete_resource(
         self,
@@ -1783,3 +1847,580 @@ class MatterBindingManager:
 
         # Re-scan all
         await self.async_scan_automations()
+
+    # =========================================================================
+    # Debug Panel Methods
+    # =========================================================================
+
+    async def get_matter_devices(self) -> list[dict[str, Any]]:
+        """Get list of all Matter devices with their node IDs.
+
+        Returns:
+            List of device info dictionaries.
+        """
+        devices: list[dict[str, Any]] = []
+        device_registry = dr.async_get(self._hass)
+        entity_registry = er.async_get(self._hass)
+
+        # Find all Matter devices
+        for device_entry in device_registry.devices.values():
+            # Check if this is a Matter device
+            is_matter = any(
+                ident[0] == MATTER_DOMAIN for ident in device_entry.identifiers
+            )
+            if not is_matter:
+                continue
+
+            # Get the node ID by looking up the MatterNode from the device entry
+            node_id: int | None = None
+            try:
+                matter_node = get_node_from_device_entry(self._hass, device_entry)
+                if matter_node is not None:
+                    node_id = matter_node.node_id
+            except Exception:  # noqa: BLE001
+                # If we can't get the node, skip this device
+                pass
+
+            # Get entities for this device
+            entity_count = len(
+                er.async_entries_for_device(entity_registry, device_entry.id)
+            )
+
+            devices.append(
+                {
+                    "device_id": device_entry.id,
+                    "device_name": device_entry.name
+                    or device_entry.name_by_user
+                    or "Unknown",
+                    "node_id": node_id,
+                    "manufacturer": device_entry.manufacturer,
+                    "model": device_entry.model,
+                    "entity_count": entity_count,
+                }
+            )
+
+        # Sort by node_id, putting devices without node_id at the end
+        devices.sort(key=lambda d: (d["node_id"] is None, d["node_id"] or 0))
+        return devices
+
+    def _get_matter_node(self, node_id: int) -> Any | None:
+        """Get a MatterNode by ID from the Matter client cache.
+
+        Args:
+            node_id: The Matter node ID.
+
+        Returns:
+            The MatterNode object or None if not found.
+        """
+        try:
+            matter_client = self._adapter._get_matter_client()  # noqa: SLF001
+            for node in matter_client.get_nodes():
+                if node.node_id == node_id:
+                    return node
+        except (RuntimeError, AttributeError, KeyError, StopIteration):
+            pass
+        return None
+
+    def _read_cluster_from_cache(
+        self, node: Any, endpoint_id: int, cluster_id: int, attribute_id: int = 0
+    ) -> Any | None:
+        """Read cluster attribute data from the cached node model.
+
+        This does NOT make network requests - it reads from the Matter client's
+        cached node state which is kept even when nodes go offline.
+
+        Args:
+            node: The MatterNode object.
+            endpoint_id: The endpoint ID.
+            cluster_id: The cluster ID.
+            attribute_id: The attribute ID (default 0).
+
+        Returns:
+            The attribute value or None if not found.
+        """
+        try:
+            endpoints = getattr(node, "endpoints", None)
+            if not endpoints:
+                return None
+
+            endpoint = endpoints.get(endpoint_id)
+            if not endpoint:
+                return None
+
+            # Method 1: Try endpoint.get_attribute_value() which is the cleanest API
+            if hasattr(endpoint, "get_attribute_value"):
+                try:
+                    value = endpoint.get_attribute_value(cluster_id, attribute_id)
+                    if value is not None:
+                        return value
+                except Exception:  # noqa: BLE001
+                    pass
+
+            # Method 2: Try endpoint.get_cluster() then access attribute
+            if hasattr(endpoint, "get_cluster"):
+                try:
+                    cluster = endpoint.get_cluster(cluster_id)
+                    if cluster is not None:
+                        # Try common attribute names based on cluster type
+                        attr_names = {
+                            31: "acl",  # AccessControl
+                            30: "binding",  # Binding
+                            63: ("groupKeyMap", "groupTable"),  # GroupKeyManagement
+                            4: "nameSupport",  # Groups
+                        }
+                        names_to_try = attr_names.get(cluster_id, ())
+                        if isinstance(names_to_try, str):
+                            names_to_try = (names_to_try,)
+                        for name in names_to_try:
+                            if hasattr(cluster, name):
+                                return getattr(cluster, name)
+                except Exception:  # noqa: BLE001
+                    pass
+
+            # Method 3: Try accessing clusters dict directly
+            if hasattr(endpoint, "clusters"):
+                clusters = endpoint.clusters
+                if isinstance(clusters, dict):
+                    cluster = clusters.get(cluster_id)
+                    if cluster is not None:
+                        # Try to get the attribute
+                        if hasattr(cluster, "get"):
+                            value = cluster.get(attribute_id)
+                            if value is not None:
+                                return value
+
+        except Exception as err:  # noqa: BLE001
+            LOGGER.debug("Error reading cluster from cache: %s", err)
+
+        return None
+
+    async def get_device_raw_data(self, node_id: int) -> dict[str, Any]:
+        """Get comprehensive raw Matter cluster data from a device.
+
+        This reads from the Matter client's cached node model, which is available
+        even when nodes are offline. The cache is updated when nodes communicate.
+
+        Reads these clusters:
+        - ACL (AccessControl cluster, endpoint 0, cluster 31)
+        - Bindings (Binding cluster, various endpoints, cluster 30)
+        - Groups (GroupKeyManagement cluster, endpoint 0, cluster 63)
+
+        Args:
+            node_id: The Matter node ID.
+
+        Returns:
+            Dict with all cluster data and parsed entries.
+        """
+        LOGGER.info("Getting comprehensive raw data for node %d (from cache)", node_id)
+
+        result: dict[str, Any] = {
+            "node_id": node_id,
+            "acls": [],
+            "bindings": [],
+            "groups": [],
+            "group_key_sets": [],
+            "group_key_map": [],
+            "errors": [],
+        }
+
+        # Get the node from cache
+        node = self._get_matter_node(node_id)
+        if node is None:
+            result["errors"].append(f"Node {node_id} not found in Matter client cache")
+            return result
+
+        # Check if node is available
+        is_available = getattr(node, "available", True)
+        if not is_available:
+            result["errors"].append(f"Node {node_id} is offline - showing cached data")
+
+        # Read ACL cluster (endpoint 0, cluster 31)
+        acl_data = self._read_cluster_from_cache(node, 0, 31, 0)
+        if acl_data is not None:
+            result["acls"] = self._parse_acl_list(acl_data)
+        else:
+            result["errors"].append("ACL data not in cache")
+
+        # Try to read Bindings from multiple endpoints (cluster 30)
+        endpoints_to_check = list(getattr(node, "endpoints", {}).keys())
+        for endpoint_id in endpoints_to_check:
+            binding_data = self._read_cluster_from_cache(node, endpoint_id, 30, 0)
+            if binding_data is not None and binding_data:
+                parsed = self._parse_binding_list(binding_data, endpoint_id)
+                if parsed:
+                    result["bindings"].extend(parsed)
+
+        if not result["bindings"]:
+            result["errors"].append("No bindings found in cache")
+
+        # Read GroupKeyManagement cluster (endpoint 0, cluster 63)
+        # Attribute 0 = GroupKeyMap
+        gkm_map = self._read_cluster_from_cache(node, 0, 63, 0)
+        if gkm_map is not None:
+            result["group_key_map"] = self._parse_group_key_map(gkm_map)
+
+        # GroupTable (attribute 1)
+        group_table = self._read_cluster_from_cache(node, 0, 63, 1)
+        if group_table is not None:
+            result["groups"] = self._parse_group_table(group_table)
+
+        return result
+
+    def _parse_acl_list(self, acl_data: Any) -> list[dict[str, Any]]:
+        """Parse ACL list into readable format."""
+        parsed: list[dict[str, Any]] = []
+
+        if not isinstance(acl_data, list):
+            return parsed
+
+        for idx, acl_entry in enumerate(acl_data):
+            entry: dict[str, Any] = {
+                "index": idx,
+                "raw": self._serialize_cluster_data(acl_entry),
+            }
+
+            # Parse common ACL fields
+            if isinstance(acl_entry, dict):
+                entry["privilege"] = self._get_privilege_name(acl_entry.get("1", 0))
+                entry["auth_mode"] = self._get_auth_mode_name(acl_entry.get("2", 0))
+                subjects = acl_entry.get("3", [])
+                entry["subjects"] = self._serialize_cluster_data(subjects) or []
+                targets = acl_entry.get("4", [])
+                entry["targets"] = self._serialize_cluster_data(targets) or []
+            else:
+                # Chip cluster object
+                entry["privilege"] = self._get_privilege_name(
+                    getattr(acl_entry, "privilege", 0)
+                )
+                entry["auth_mode"] = self._get_auth_mode_name(
+                    getattr(acl_entry, "authMode", 0)
+                )
+                subjects = getattr(acl_entry, "subjects", [])
+                entry["subjects"] = self._serialize_cluster_data(subjects) or []
+                targets = getattr(acl_entry, "targets", [])
+                entry["targets"] = self._serialize_cluster_data(targets) or []
+
+            parsed.append(entry)
+
+        return parsed
+
+    def _parse_binding_list(
+        self, binding_data: Any, endpoint: int
+    ) -> list[dict[str, Any]]:
+        """Parse binding list into readable format."""
+        parsed: list[dict[str, Any]] = []
+
+        if not isinstance(binding_data, list):
+            return parsed
+
+        for idx, binding_entry in enumerate(binding_data):
+            entry: dict[str, Any] = {
+                "index": idx,
+                "endpoint": endpoint,
+                "raw": self._serialize_cluster_data(binding_entry),
+            }
+
+            if isinstance(binding_entry, dict):
+                entry["node_id"] = binding_entry.get("1")
+                entry["group_id"] = binding_entry.get("2")
+                entry["target_endpoint"] = binding_entry.get("3")
+                entry["cluster_id"] = binding_entry.get("4")
+                entry["fabric_index"] = binding_entry.get("254")
+            else:
+                entry["node_id"] = getattr(binding_entry, "node", None)
+                entry["group_id"] = getattr(binding_entry, "group", None)
+                entry["target_endpoint"] = getattr(binding_entry, "endpoint", None)
+                entry["cluster_id"] = getattr(binding_entry, "cluster", None)
+                entry["fabric_index"] = getattr(binding_entry, "fabricIndex", None)
+
+            # Determine binding type
+            if entry.get("group_id"):
+                entry["type"] = "group"
+            elif entry.get("node_id"):
+                entry["type"] = "unicast"
+            else:
+                entry["type"] = "unknown"
+
+            parsed.append(entry)
+
+        return parsed
+
+    def _parse_group_key_map(self, gkm_data: Any) -> list[dict[str, Any]]:
+        """Parse GroupKeyMap into readable format."""
+        parsed: list[dict[str, Any]] = []
+
+        if not isinstance(gkm_data, list):
+            return parsed
+
+        for idx, entry in enumerate(gkm_data):
+            item: dict[str, Any] = {
+                "index": idx,
+                "raw": self._serialize_cluster_data(entry),
+            }
+
+            if isinstance(entry, dict):
+                item["group_id"] = entry.get("1")
+                item["group_key_set_id"] = entry.get("2")
+                item["fabric_index"] = entry.get("254")
+            else:
+                item["group_id"] = getattr(entry, "groupId", None)
+                item["group_key_set_id"] = getattr(entry, "groupKeySetID", None)
+                item["fabric_index"] = getattr(entry, "fabricIndex", None)
+
+            parsed.append(item)
+
+        return parsed
+
+    def _parse_group_table(self, group_table: Any) -> list[dict[str, Any]]:
+        """Parse GroupTable into readable format."""
+        parsed: list[dict[str, Any]] = []
+
+        if not isinstance(group_table, list):
+            return parsed
+
+        for idx, entry in enumerate(group_table):
+            item: dict[str, Any] = {
+                "index": idx,
+                "raw": self._serialize_cluster_data(entry),
+            }
+
+            if isinstance(entry, dict):
+                item["group_id"] = entry.get("1")
+                item["endpoints"] = entry.get("2", [])
+                item["group_name"] = entry.get("3", "")
+                item["fabric_index"] = entry.get("254")
+            else:
+                item["group_id"] = getattr(entry, "groupId", None)
+                item["endpoints"] = getattr(entry, "endpoints", [])
+                item["group_name"] = getattr(entry, "groupName", "")
+                item["fabric_index"] = getattr(entry, "fabricIndex", None)
+
+            parsed.append(item)
+
+        return parsed
+
+    def _get_privilege_name(self, privilege: int) -> str:
+        """Get human-readable privilege name."""
+        privileges = {
+            1: "View",
+            2: "ProxyView",
+            3: "Operate",
+            4: "Manage",
+            5: "Administer",
+        }
+        return privileges.get(privilege, f"Unknown({privilege})")
+
+    def _get_auth_mode_name(self, auth_mode: int) -> str:
+        """Get human-readable authentication mode name."""
+        modes = {
+            1: "PASE",  # noqa
+            2: "CASE",
+            3: "Group",
+        }
+        return modes.get(auth_mode, f"Unknown({auth_mode})")
+
+    async def delete_acl_entry(self, node_id: int, acl_index: int) -> bool:
+        """Delete an ACL entry by index.
+
+        Args:
+            node_id: The Matter node ID.
+            acl_index: The index of the ACL entry to delete.
+
+        Returns:
+            True if deletion succeeded.
+        """
+        LOGGER.warning(
+            "Deleting ACL entry: node=%d, index=%d",
+            node_id,
+            acl_index,
+        )
+
+        try:
+            matter_client = self._adapter._get_matter_client()  # noqa: SLF001
+            acl_path = "0/31/0"
+            current_acls = await matter_client.read_attribute(node_id, acl_path)
+            acl_list = current_acls.get(acl_path, [])
+
+            if not isinstance(acl_list, list):
+                LOGGER.error("Invalid ACL data format")
+                return False
+
+            if acl_index < 0 or acl_index >= len(acl_list):
+                LOGGER.error(
+                    "ACL index %d out of range (0-%d)", acl_index, len(acl_list) - 1
+                )
+                return False
+
+            # Remove the entry at the specified index
+            updated_list = acl_list[:acl_index] + acl_list[acl_index + 1 :]
+
+            await matter_client.write_attribute(
+                node_id=node_id,
+                attribute_path=acl_path,
+                value=updated_list,
+            )
+            LOGGER.info("Deleted ACL entry %d from node %d", acl_index, node_id)
+
+        except (HomeAssistantError, OSError, ValueError) as err:
+            LOGGER.error("Failed to delete ACL entry: %s", err)
+            return False
+        else:
+            return True
+
+    async def delete_binding_entry(
+        self, node_id: int, endpoint: int, binding_index: int
+    ) -> bool:
+        """Delete a binding entry by index.
+
+        Args:
+            node_id: The Matter node ID.
+            endpoint: The endpoint containing the binding.
+            binding_index: The index of the binding to delete.
+
+        Returns:
+            True if deletion succeeded.
+        """
+        LOGGER.warning(
+            "Deleting binding entry: node=%d, endpoint=%d, index=%d",
+            node_id,
+            endpoint,
+            binding_index,
+        )
+
+        try:
+            matter_client = self._adapter._get_matter_client()  # noqa: SLF001
+            binding_path = f"{endpoint}/30/0"
+            current_bindings = await matter_client.read_attribute(node_id, binding_path)
+            binding_list = current_bindings.get(binding_path, [])
+
+            if not isinstance(binding_list, list):
+                LOGGER.error("Invalid binding data format")
+                return False
+
+            if binding_index < 0 or binding_index >= len(binding_list):
+                LOGGER.error(
+                    "Binding index %d out of range (0-%d)",
+                    binding_index,
+                    len(binding_list) - 1,
+                )
+                return False
+
+            # Remove the entry at the specified index
+            updated_list = (
+                binding_list[:binding_index] + binding_list[binding_index + 1 :]
+            )
+
+            await matter_client.write_attribute(
+                node_id=node_id,
+                attribute_path=binding_path,
+                value=updated_list,
+            )
+            LOGGER.info(
+                "Deleted binding entry %d from node %d endpoint %d",
+                binding_index,
+                node_id,
+                endpoint,
+            )
+
+        except (HomeAssistantError, OSError, ValueError) as err:
+            LOGGER.error("Failed to delete binding entry: %s", err)
+            return False
+        else:
+            return True
+
+    async def delete_group_entry(
+        self, node_id: int, endpoint: int, group_id: int
+    ) -> bool:
+        """Delete a group membership entry.
+
+        Args:
+            node_id: The Matter node ID.
+            endpoint: The endpoint to remove from group.
+            group_id: The group ID to leave.
+
+        Returns:
+            True if deletion succeeded.
+        """
+        LOGGER.warning(
+            "Deleting group entry: node=%d, endpoint=%d, group_id=%d",
+            node_id,
+            endpoint,
+            group_id,
+        )
+
+        try:
+            matter_client = self._adapter._get_matter_client()  # noqa: SLF001
+
+            # Use RemoveGroup command (Groups cluster, endpoint 1)
+            # Command 3 = RemoveGroup
+            await matter_client.send_device_command(
+                node_id=node_id,
+                endpoint_id=endpoint,
+                command=Clusters.Groups.Commands.RemoveGroup(
+                    groupID=group_id,
+                ),
+            )
+            LOGGER.info(
+                "Removed node %d endpoint %d from group %d",
+                node_id,
+                endpoint,
+                group_id,
+            )
+
+        except (HomeAssistantError, OSError, ValueError) as err:
+            LOGGER.error("Failed to delete group entry: %s", err)
+            return False
+        else:
+            return True
+
+    async def delete_group_key_map_entry(self, node_id: int, entry_index: int) -> bool:
+        """Delete a GroupKeyMap entry by index.
+
+        Args:
+            node_id: The Matter node ID.
+            entry_index: The index of the entry to delete.
+
+        Returns:
+            True if deletion succeeded.
+        """
+        LOGGER.warning(
+            "Deleting GroupKeyMap entry: node=%d, index=%d",
+            node_id,
+            entry_index,
+        )
+
+        try:
+            matter_client = self._adapter._get_matter_client()  # noqa: SLF001
+            gkm_path = "0/63/0"
+            current_map = await matter_client.read_attribute(node_id, gkm_path)
+            map_list = current_map.get(gkm_path, [])
+
+            if not isinstance(map_list, list):
+                LOGGER.error("Invalid GroupKeyMap data format")
+                return False
+
+            if entry_index < 0 or entry_index >= len(map_list):
+                LOGGER.error(
+                    "GroupKeyMap index %d out of range (0-%d)",
+                    entry_index,
+                    len(map_list) - 1,
+                )
+                return False
+
+            # Remove the entry at the specified index
+            updated_list = map_list[:entry_index] + map_list[entry_index + 1 :]
+
+            await matter_client.write_attribute(
+                node_id=node_id,
+                attribute_path=gkm_path,
+                value=updated_list,
+            )
+            LOGGER.info(
+                "Deleted GroupKeyMap entry %d from node %d", entry_index, node_id
+            )
+
+        except (HomeAssistantError, OSError, ValueError) as err:
+            LOGGER.error("Failed to delete GroupKeyMap entry: %s", err)
+            return False
+        else:
+            return True

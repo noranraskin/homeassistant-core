@@ -15,10 +15,17 @@ from .const import (
     CONF_ENABLE_GROUP_BINDINGS,
     DOMAIN,
     LOGGER,
+    WS_TYPE_DELETE_ACL_ENTRY,
+    WS_TYPE_DELETE_BINDING_ENTRY,
+    WS_TYPE_DELETE_GROUP_ENTRY,
+    WS_TYPE_DELETE_GROUP_KEY_MAP_ENTRY,
     WS_TYPE_DELETE_RESOURCE,
     WS_TYPE_FORCE_RECONCILE,
     WS_TYPE_GET_AUTOMATION_DETAIL,
     WS_TYPE_GET_DASHBOARD_DATA,
+    WS_TYPE_GET_DEBUG_CONFIG,
+    WS_TYPE_GET_DEVICE_RAW_DATA,
+    WS_TYPE_GET_MATTER_DEVICES,
     WS_TYPE_GET_NODE_RAW_DATA,
     WS_TYPE_SET_BINDING_PREFERENCE,
 )
@@ -36,6 +43,14 @@ def async_register_websocket_commands(hass: HomeAssistant) -> None:
     websocket_api.async_register_command(hass, ws_get_node_raw_data)
     websocket_api.async_register_command(hass, ws_delete_resource)
     websocket_api.async_register_command(hass, ws_force_reconcile)
+    # Debug panel commands
+    websocket_api.async_register_command(hass, ws_get_debug_config)
+    websocket_api.async_register_command(hass, ws_get_matter_devices)
+    websocket_api.async_register_command(hass, ws_get_device_raw_data)
+    websocket_api.async_register_command(hass, ws_delete_acl_entry)
+    websocket_api.async_register_command(hass, ws_delete_binding_entry)
+    websocket_api.async_register_command(hass, ws_delete_group_entry)
+    websocket_api.async_register_command(hass, ws_delete_group_key_map_entry)
 
 
 def _get_runtime_data(hass: HomeAssistant) -> MatterAutoBindData | None:
@@ -341,4 +356,338 @@ async def ws_force_reconcile(
         connection.send_result(msg["id"], {"success": True})
     except Exception as err:  # noqa: BLE001
         LOGGER.exception("Error forcing reconcile")
+        connection.send_error(msg["id"], "error", str(err))
+
+
+# =============================================================================
+# Debug Panel: Configuration
+# =============================================================================
+
+
+def _is_debug_enabled(hass: HomeAssistant) -> bool:
+    """Check if debug panel is enabled in config."""
+    config_entries = hass.config_entries.async_entries(DOMAIN)
+    if config_entries:
+        return config_entries[0].options.get(CONF_ENABLE_DEBUG_PANEL, False)
+    return False
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): WS_TYPE_GET_DEBUG_CONFIG,
+    }
+)
+@websocket_api.async_response
+async def ws_get_debug_config(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Get debug panel configuration.
+
+    Returns whether debug features are enabled.
+    """
+    debug_enabled = _is_debug_enabled(hass)
+    connection.send_result(
+        msg["id"],
+        {
+            "debug_enabled": debug_enabled,
+        },
+    )
+
+
+# =============================================================================
+# Debug Panel: List Matter Devices
+# =============================================================================
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): WS_TYPE_GET_MATTER_DEVICES,
+    }
+)
+@websocket_api.require_admin
+@websocket_api.async_response
+async def ws_get_matter_devices(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Get list of all Matter devices.
+
+    Returns device info including node ID for each Matter device.
+    Only available to admin users with debug panel enabled.
+    """
+    if not _is_debug_enabled(hass):
+        connection.send_error(
+            msg["id"],
+            "debug_disabled",
+            "Debug panel is not enabled in integration settings",
+        )
+        return
+
+    runtime_data = _get_runtime_data(hass)
+    if runtime_data is None:
+        connection.send_error(
+            msg["id"],
+            "not_loaded",
+            "Matter AutoBind integration not loaded",
+        )
+        return
+
+    try:
+        devices = await runtime_data.manager.get_matter_devices()
+        connection.send_result(msg["id"], {"devices": devices})
+    except Exception as err:  # noqa: BLE001
+        LOGGER.exception("Error getting Matter devices")
+        connection.send_error(msg["id"], "error", str(err))
+
+
+# =============================================================================
+# Debug Panel: Get Device Raw Data
+# =============================================================================
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): WS_TYPE_GET_DEVICE_RAW_DATA,
+        vol.Required("node_id"): vol.Coerce(int),
+    }
+)
+@websocket_api.require_admin
+@websocket_api.async_response
+async def ws_get_device_raw_data(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Get comprehensive raw data from a Matter device.
+
+    Returns ALL ACLs, bindings, groups, group keys, and group key maps.
+    Only available to admin users with debug panel enabled.
+    """
+    if not _is_debug_enabled(hass):
+        connection.send_error(
+            msg["id"],
+            "debug_disabled",
+            "Debug panel is not enabled in integration settings",
+        )
+        return
+
+    runtime_data = _get_runtime_data(hass)
+    if runtime_data is None:
+        connection.send_error(
+            msg["id"],
+            "not_loaded",
+            "Matter AutoBind integration not loaded",
+        )
+        return
+
+    try:
+        data = await runtime_data.manager.get_device_raw_data(msg["node_id"])
+        connection.send_result(msg["id"], data)
+    except Exception as err:  # noqa: BLE001
+        LOGGER.exception("Error getting device raw data")
+        connection.send_error(msg["id"], "error", str(err))
+
+
+# =============================================================================
+# Debug Panel: Delete ACL Entry
+# =============================================================================
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): WS_TYPE_DELETE_ACL_ENTRY,
+        vol.Required("node_id"): vol.Coerce(int),
+        vol.Required("acl_index"): vol.Coerce(int),
+    }
+)
+@websocket_api.require_admin
+@websocket_api.async_response
+async def ws_delete_acl_entry(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Delete a specific ACL entry by index.
+
+    Only available to admin users with debug panel enabled.
+    """
+    if not _is_debug_enabled(hass):
+        connection.send_error(
+            msg["id"],
+            "debug_disabled",
+            "Debug panel is not enabled in integration settings",
+        )
+        return
+
+    runtime_data = _get_runtime_data(hass)
+    if runtime_data is None:
+        connection.send_error(
+            msg["id"],
+            "not_loaded",
+            "Matter AutoBind integration not loaded",
+        )
+        return
+
+    try:
+        success = await runtime_data.manager.delete_acl_entry(
+            msg["node_id"], msg["acl_index"]
+        )
+        connection.send_result(msg["id"], {"success": success})
+    except Exception as err:  # noqa: BLE001
+        LOGGER.exception("Error deleting ACL entry")
+        connection.send_error(msg["id"], "error", str(err))
+
+
+# =============================================================================
+# Debug Panel: Delete Binding Entry
+# =============================================================================
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): WS_TYPE_DELETE_BINDING_ENTRY,
+        vol.Required("node_id"): vol.Coerce(int),
+        vol.Required("endpoint"): vol.Coerce(int),
+        vol.Required("binding_index"): vol.Coerce(int),
+    }
+)
+@websocket_api.require_admin
+@websocket_api.async_response
+async def ws_delete_binding_entry(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Delete a specific binding entry by index.
+
+    Only available to admin users with debug panel enabled.
+    """
+    if not _is_debug_enabled(hass):
+        connection.send_error(
+            msg["id"],
+            "debug_disabled",
+            "Debug panel is not enabled in integration settings",
+        )
+        return
+
+    runtime_data = _get_runtime_data(hass)
+    if runtime_data is None:
+        connection.send_error(
+            msg["id"],
+            "not_loaded",
+            "Matter AutoBind integration not loaded",
+        )
+        return
+
+    try:
+        success = await runtime_data.manager.delete_binding_entry(
+            msg["node_id"], msg["endpoint"], msg["binding_index"]
+        )
+        connection.send_result(msg["id"], {"success": success})
+    except Exception as err:  # noqa: BLE001
+        LOGGER.exception("Error deleting binding entry")
+        connection.send_error(msg["id"], "error", str(err))
+
+
+# =============================================================================
+# Debug Panel: Delete Group Entry
+# =============================================================================
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): WS_TYPE_DELETE_GROUP_ENTRY,
+        vol.Required("node_id"): vol.Coerce(int),
+        vol.Required("endpoint"): vol.Coerce(int),
+        vol.Required("group_id"): vol.Coerce(int),
+    }
+)
+@websocket_api.require_admin
+@websocket_api.async_response
+async def ws_delete_group_entry(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Delete a group membership entry.
+
+    Only available to admin users with debug panel enabled.
+    """
+    if not _is_debug_enabled(hass):
+        connection.send_error(
+            msg["id"],
+            "debug_disabled",
+            "Debug panel is not enabled in integration settings",
+        )
+        return
+
+    runtime_data = _get_runtime_data(hass)
+    if runtime_data is None:
+        connection.send_error(
+            msg["id"],
+            "not_loaded",
+            "Matter AutoBind integration not loaded",
+        )
+        return
+
+    try:
+        success = await runtime_data.manager.delete_group_entry(
+            msg["node_id"], msg["endpoint"], msg["group_id"]
+        )
+        connection.send_result(msg["id"], {"success": success})
+    except Exception as err:  # noqa: BLE001
+        LOGGER.exception("Error deleting group entry")
+        connection.send_error(msg["id"], "error", str(err))
+
+
+# =============================================================================
+# Debug Panel: Delete GroupKeyMap Entry
+# =============================================================================
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): WS_TYPE_DELETE_GROUP_KEY_MAP_ENTRY,
+        vol.Required("node_id"): vol.Coerce(int),
+        vol.Required("entry_index"): vol.Coerce(int),
+    }
+)
+@websocket_api.require_admin
+@websocket_api.async_response
+async def ws_delete_group_key_map_entry(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Delete a GroupKeyMap entry by index.
+
+    Only available to admin users with debug panel enabled.
+    """
+    if not _is_debug_enabled(hass):
+        connection.send_error(
+            msg["id"],
+            "debug_disabled",
+            "Debug panel is not enabled in integration settings",
+        )
+        return
+
+    runtime_data = _get_runtime_data(hass)
+    if runtime_data is None:
+        connection.send_error(
+            msg["id"],
+            "not_loaded",
+            "Matter AutoBind integration not loaded",
+        )
+        return
+
+    try:
+        success = await runtime_data.manager.delete_group_key_map_entry(
+            msg["node_id"], msg["entry_index"]
+        )
+        connection.send_result(msg["id"], {"success": success})
+    except Exception as err:  # noqa: BLE001
+        LOGGER.exception("Error deleting GroupKeyMap entry")
         connection.send_error(msg["id"], "error", str(err))

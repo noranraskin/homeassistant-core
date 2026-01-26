@@ -10,6 +10,16 @@ class MatterAutoBindPanel extends HTMLElement {
     this._error = null;
     this._selectedAutomation = null;
     this._automationDetail = null;
+    // Tab state: "automations" or "debug"
+    this._activeTab = "automations";
+    // Debug panel state
+    this._debugEnabled = false;
+    this._matterDevices = [];
+    this._selectedDevice = null;
+    this._deviceRawData = null;
+    this._deviceLoading = false;
+    // Confirmation dialog state
+    this._confirmDialog = null;
   }
 
   set hass(hass) {
@@ -26,9 +36,22 @@ class MatterAutoBindPanel extends HTMLElement {
   }
 
   async _initialize() {
+    await this._loadDebugConfig();
     this._render();
     this._attachEventListeners();
     await this._loadDashboardData();
+  }
+
+  async _loadDebugConfig() {
+    try {
+      const result = await this._callService(
+        "matter_autobind/get_debug_config",
+        {},
+      );
+      this._debugEnabled = result.debug_enabled || false;
+    } catch {
+      this._debugEnabled = false;
+    }
   }
 
   _attachEventListeners() {
@@ -39,6 +62,9 @@ class MatterAutoBindPanel extends HTMLElement {
 
       const action = target.dataset.action;
       const automationId = target.dataset.automationId;
+      const nodeId = target.dataset.nodeId
+        ? parseInt(target.dataset.nodeId, 10)
+        : null;
 
       switch (action) {
         case "refresh":
@@ -52,6 +78,60 @@ class MatterAutoBindPanel extends HTMLElement {
           break;
         case "select-automation":
           this._toggleAutomationDetail(automationId);
+          break;
+        case "tab-automations":
+          this._activeTab = "automations";
+          this._render();
+          break;
+        case "tab-debug":
+          this._activeTab = "debug";
+          this._loadMatterDevices();
+          break;
+        case "select-device":
+          if (nodeId !== null) {
+            this._loadDeviceRawData(nodeId);
+          }
+          break;
+        case "refresh-devices":
+          this._loadMatterDevices();
+          break;
+        case "refresh-device-data":
+          if (this._selectedDevice) {
+            this._loadDeviceRawData(this._selectedDevice);
+          }
+          break;
+        case "delete-acl":
+          this._showDeleteConfirmation("acl", {
+            node_id: nodeId,
+            acl_index: parseInt(target.dataset.index, 10),
+          });
+          break;
+        case "delete-binding":
+          this._showDeleteConfirmation("binding", {
+            node_id: nodeId,
+            endpoint: parseInt(target.dataset.endpoint, 10),
+            binding_index: parseInt(target.dataset.index, 10),
+          });
+          break;
+        case "delete-group":
+          this._showDeleteConfirmation("group", {
+            node_id: nodeId,
+            endpoint: parseInt(target.dataset.endpoint, 10),
+            group_id: parseInt(target.dataset.groupId, 10),
+          });
+          break;
+        case "delete-gkm":
+          this._showDeleteConfirmation("group_key_map", {
+            node_id: nodeId,
+            entry_index: parseInt(target.dataset.index, 10),
+          });
+          break;
+        case "confirm-delete":
+          this._executeDelete();
+          break;
+        case "cancel-delete":
+          this._confirmDialog = null;
+          this._render();
           break;
       }
     });
@@ -143,6 +223,99 @@ class MatterAutoBindPanel extends HTMLElement {
       }
     } catch (err) {
       alert("Failed to set binding preference: " + err.message);
+    }
+  }
+
+  async _loadMatterDevices() {
+    this._matterDevices = [];
+    this._selectedDevice = null;
+    this._deviceRawData = null;
+    this._render();
+
+    try {
+      const result = await this._callService(
+        "matter_autobind/get_matter_devices",
+        {},
+      );
+      this._matterDevices = result.devices || [];
+    } catch (err) {
+      console.error("Failed to load Matter devices:", err);
+    }
+    this._render();
+  }
+
+  async _loadDeviceRawData(nodeId) {
+    this._selectedDevice = nodeId;
+    this._deviceRawData = null;
+    this._deviceLoading = true;
+    this._render();
+
+    try {
+      const result = await this._callService(
+        "matter_autobind/get_device_raw_data",
+        { node_id: nodeId },
+      );
+      this._deviceRawData = result;
+      this._deviceLoading = false;
+    } catch (err) {
+      this._deviceRawData = {
+        error: err.message || "Failed to load device data",
+      };
+      this._deviceLoading = false;
+    }
+    this._render();
+  }
+
+  _showDeleteConfirmation(type, params) {
+    let message = "";
+    switch (type) {
+      case "acl":
+        message = `Delete ACL entry at index ${params.acl_index} from node ${params.node_id}?`;
+        break;
+      case "binding":
+        message = `Delete binding at index ${params.binding_index} (endpoint ${params.endpoint}) from node ${params.node_id}?`;
+        break;
+      case "group":
+        message = `Remove group ${params.group_id} (endpoint ${params.endpoint}) from node ${params.node_id}?`;
+        break;
+      case "group_key_map":
+        message = `Delete GroupKeyMap entry at index ${params.entry_index} from node ${params.node_id}?`;
+        break;
+    }
+    this._confirmDialog = { type, params, message };
+    this._render();
+  }
+
+  async _executeDelete() {
+    if (!this._confirmDialog) return;
+
+    const { type, params } = this._confirmDialog;
+    this._confirmDialog = null;
+    this._render();
+
+    try {
+      let serviceType = "";
+      switch (type) {
+        case "acl":
+          serviceType = "matter_autobind/delete_acl_entry";
+          break;
+        case "binding":
+          serviceType = "matter_autobind/delete_binding_entry";
+          break;
+        case "group":
+          serviceType = "matter_autobind/delete_group_entry";
+          break;
+        case "group_key_map":
+          serviceType = "matter_autobind/delete_group_key_map_entry";
+          break;
+      }
+      await this._callService(serviceType, params);
+      // Refresh device data
+      if (this._selectedDevice) {
+        await this._loadDeviceRawData(this._selectedDevice);
+      }
+    } catch (err) {
+      alert("Delete failed: " + err.message);
     }
   }
 
@@ -356,6 +529,170 @@ class MatterAutoBindPanel extends HTMLElement {
           color: var(--secondary-text-color);
           text-transform: uppercase;
         }
+        .tabs {
+          display: flex;
+          gap: 8px;
+          margin-bottom: 16px;
+          border-bottom: 1px solid var(--divider-color);
+          padding-bottom: 8px;
+        }
+        .tab {
+          padding: 8px 16px;
+          border: none;
+          background: transparent;
+          cursor: pointer;
+          font-size: 14px;
+          color: var(--secondary-text-color);
+          border-radius: 4px 4px 0 0;
+        }
+        .tab:hover {
+          background: var(--secondary-background-color);
+        }
+        .tab.active {
+          color: var(--primary-color);
+          border-bottom: 2px solid var(--primary-color);
+          font-weight: 500;
+        }
+        .debug-layout {
+          display: grid;
+          grid-template-columns: 280px 1fr;
+          gap: 16px;
+          min-height: 400px;
+        }
+        .device-sidebar {
+          background: var(--card-background-color);
+          border-radius: 8px;
+          padding: 12px;
+          overflow-y: auto;
+          max-height: 600px;
+        }
+        .device-sidebar-title {
+          font-weight: 500;
+          margin-bottom: 12px;
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
+        }
+        .device-sidebar-list {
+          display: grid;
+          gap: 4px;
+        }
+        .device-sidebar-item {
+          padding: 10px 12px;
+          background: var(--secondary-background-color);
+          border-radius: 4px;
+          cursor: pointer;
+          font-size: 0.9em;
+        }
+        .device-sidebar-item:hover {
+          background: var(--primary-color);
+          color: var(--text-primary-color);
+        }
+        .device-sidebar-item.selected {
+          background: var(--primary-color);
+          color: var(--text-primary-color);
+        }
+        .device-sidebar-item-name {
+          font-weight: 500;
+        }
+        .device-sidebar-item-info {
+          font-size: 0.85em;
+          opacity: 0.8;
+        }
+        .data-panel {
+          background: var(--card-background-color);
+          border-radius: 8px;
+          padding: 16px;
+          overflow-y: auto;
+          max-height: 600px;
+        }
+        .data-panel-header {
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
+          margin-bottom: 16px;
+        }
+        .data-section {
+          margin-bottom: 24px;
+        }
+        .data-section-title {
+          font-size: 14px;
+          font-weight: 500;
+          color: var(--secondary-text-color);
+          margin-bottom: 8px;
+          text-transform: uppercase;
+        }
+        .data-table {
+          width: 100%;
+          border-collapse: collapse;
+          font-size: 0.85em;
+        }
+        .data-table th, .data-table td {
+          padding: 8px 12px;
+          text-align: left;
+          border-bottom: 1px solid var(--divider-color);
+        }
+        .data-table th {
+          background: var(--secondary-background-color);
+          font-weight: 500;
+        }
+        .data-table tr:hover {
+          background: var(--secondary-background-color);
+        }
+        .btn-danger {
+          background: var(--error-color, #f44336);
+          color: white;
+        }
+        .btn-small {
+          padding: 4px 8px;
+          font-size: 12px;
+        }
+        .dialog-overlay {
+          position: fixed;
+          top: 0;
+          left: 0;
+          right: 0;
+          bottom: 0;
+          background: rgba(0, 0, 0, 0.5);
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          z-index: 1000;
+        }
+        .dialog {
+          background: var(--card-background-color);
+          border-radius: 8px;
+          padding: 24px;
+          max-width: 400px;
+          width: 90%;
+        }
+        .dialog-title {
+          font-size: 18px;
+          font-weight: 500;
+          margin-bottom: 12px;
+        }
+        .dialog-message {
+          margin-bottom: 20px;
+          color: var(--secondary-text-color);
+        }
+        .dialog-warning {
+          color: var(--error-color, #f44336);
+          font-weight: 500;
+        }
+        .dialog-actions {
+          display: flex;
+          gap: 12px;
+          justify-content: flex-end;
+        }
+        .mono {
+          font-family: monospace;
+          font-size: 0.9em;
+        }
+        .empty-state {
+          text-align: center;
+          padding: 32px;
+          color: var(--secondary-text-color);
+        }
       </style>
 
       <div class="panel-header">
@@ -371,12 +708,44 @@ class MatterAutoBindPanel extends HTMLElement {
       </div>
     `;
 
+    // Tabs (only show if debug is enabled)
+    if (this._debugEnabled) {
+      html += `
+        <div class="tabs">
+          <button class="tab ${this._activeTab === "automations" ? "active" : ""}" data-action="tab-automations">
+            Automations
+          </button>
+          <button class="tab ${this._activeTab === "debug" ? "active" : ""}" data-action="tab-debug">
+            🔧 Debug Inspector
+          </button>
+        </div>
+      `;
+    }
+
     if (this._error) {
       html += `<div class="error">Error: ${this._error}</div>`;
     }
 
+    // Tab content
+    if (this._activeTab === "debug" && this._debugEnabled) {
+      html += this._renderDebugTab();
+    } else {
+      html += this._renderAutomationsTab();
+    }
+
+    // Confirmation dialog
+    if (this._confirmDialog) {
+      html += this._renderConfirmDialog();
+    }
+
+    this.shadowRoot.innerHTML = html;
+  }
+
+  _renderAutomationsTab() {
+    let html = "";
+
     if (this._loading) {
-      html += `<div class="loading">Loading automations...</div>`;
+      return `<div class="loading">Loading automations...</div>`;
     } else {
       // Stats
       const bound = this._automations.filter(
@@ -434,7 +803,239 @@ class MatterAutoBindPanel extends HTMLElement {
       }
     }
 
-    this.shadowRoot.innerHTML = html;
+    return html;
+  }
+
+  _renderDebugTab() {
+    let html = `<div class="debug-layout">`;
+
+    // Device sidebar
+    html += `
+      <div class="device-sidebar">
+        <div class="device-sidebar-title">
+          <span>Matter Devices</span>
+          <button class="btn btn-small btn-secondary" data-action="refresh-devices">↻</button>
+        </div>
+        <div class="device-sidebar-list">
+    `;
+
+    if (this._matterDevices.length === 0) {
+      html += `<div class="empty-state">No Matter devices found</div>`;
+    } else {
+      for (const device of this._matterDevices) {
+        // Skip devices without a valid node_id
+        if (device.node_id === null || device.node_id === undefined) {
+          continue;
+        }
+        const isSelected = this._selectedDevice === device.node_id;
+        html += `
+          <div class="device-sidebar-item ${isSelected ? "selected" : ""}" 
+               data-action="select-device"
+               data-node-id="${device.node_id}">
+            <div class="device-sidebar-item-name">${this._escapeHtml(device.device_name)}</div>
+            <div class="device-sidebar-item-info">Node ${device.node_id} · ${this._escapeHtml(device.model || "Unknown")}</div>
+          </div>
+        `;
+      }
+    }
+
+    html += `</div></div>`;
+
+    // Data panel
+    html += `<div class="data-panel">`;
+
+    if (!this._selectedDevice) {
+      html += `<div class="empty-state">Select a device to view its Matter resources</div>`;
+    } else if (this._deviceLoading) {
+      html += `<div class="loading">Loading device data...</div>`;
+    } else if (this._deviceRawData) {
+      html += this._renderDeviceRawData();
+    }
+
+    html += `</div></div>`;
+
+    return html;
+  }
+
+  _renderDeviceRawData() {
+    const data = this._deviceRawData;
+    const nodeId = this._selectedDevice;
+
+    if (data.error) {
+      return `<div class="error">${data.error}</div>`;
+    }
+
+    let html = `
+      <div class="data-panel-header">
+        <div class="detail-title">Node ${nodeId}</div>
+        <button class="btn btn-small btn-secondary" data-action="refresh-device-data">↻ Refresh</button>
+      </div>
+    `;
+
+    // ACLs
+    html += `<div class="data-section">
+      <div class="data-section-title">ACLs (${data.acls?.length || 0})</div>`;
+
+    if (data.acls && data.acls.length > 0) {
+      html += `<table class="data-table">
+        <tr>
+          <th>Index</th>
+          <th>Privilege</th>
+          <th>Auth Mode</th>
+          <th>Subjects</th>
+          <th>Targets</th>
+          <th></th>
+        </tr>`;
+
+      for (const acl of data.acls) {
+        const subjects = acl.subjects?.join(", ") || "-";
+        const targets =
+          acl.targets
+            ?.map((t) => `ep${t.endpoint || "*"}:c${t.cluster || "*"}`)
+            .join(", ") || "All";
+        html += `<tr>
+          <td>${acl.index}</td>
+          <td>${this._escapeHtml(acl.privilege_name || acl.privilege)}</td>
+          <td>${this._escapeHtml(acl.auth_mode_name || acl.auth_mode)}</td>
+          <td class="mono">${this._escapeHtml(subjects)}</td>
+          <td class="mono">${this._escapeHtml(targets)}</td>
+          <td>
+            <button class="btn btn-small btn-danger" 
+                    data-action="delete-acl"
+                    data-node-id="${nodeId}"
+                    data-index="${acl.index}">Delete</button>
+          </td>
+        </tr>`;
+      }
+      html += `</table>`;
+    } else {
+      html += `<div class="empty-state">No ACLs found</div>`;
+    }
+    html += `</div>`;
+
+    // Bindings
+    html += `<div class="data-section">
+      <div class="data-section-title">Bindings (${data.bindings?.length || 0})</div>`;
+
+    if (data.bindings && data.bindings.length > 0) {
+      html += `<table class="data-table">
+        <tr>
+          <th>Index</th>
+          <th>Source EP</th>
+          <th>Target</th>
+          <th>Target EP</th>
+          <th>Cluster</th>
+          <th></th>
+        </tr>`;
+
+      for (const binding of data.bindings) {
+        const target = binding.group_id
+          ? `Group ${binding.group_id}`
+          : `Node ${binding.node_id || "?"}`;
+        html += `<tr>
+          <td>${binding.index}</td>
+          <td>${binding.source_endpoint}</td>
+          <td class="mono">${this._escapeHtml(target)}</td>
+          <td>${binding.endpoint || "-"}</td>
+          <td class="mono">${binding.cluster || "-"}</td>
+          <td>
+            <button class="btn btn-small btn-danger" 
+                    data-action="delete-binding"
+                    data-node-id="${nodeId}"
+                    data-endpoint="${binding.source_endpoint}"
+                    data-index="${binding.index}">Delete</button>
+          </td>
+        </tr>`;
+      }
+      html += `</table>`;
+    } else {
+      html += `<div class="empty-state">No bindings found</div>`;
+    }
+    html += `</div>`;
+
+    // Groups
+    html += `<div class="data-section">
+      <div class="data-section-title">Groups (${data.groups?.length || 0})</div>`;
+
+    if (data.groups && data.groups.length > 0) {
+      html += `<table class="data-table">
+        <tr>
+          <th>Group ID</th>
+          <th>Endpoint</th>
+          <th>Name</th>
+          <th></th>
+        </tr>`;
+
+      for (const group of data.groups) {
+        html += `<tr>
+          <td>${group.group_id}</td>
+          <td>${group.endpoint}</td>
+          <td>${this._escapeHtml(group.name || "-")}</td>
+          <td>
+            <button class="btn btn-small btn-danger" 
+                    data-action="delete-group"
+                    data-node-id="${nodeId}"
+                    data-endpoint="${group.endpoint}"
+                    data-group-id="${group.group_id}">Remove</button>
+          </td>
+        </tr>`;
+      }
+      html += `</table>`;
+    } else {
+      html += `<div class="empty-state">No group memberships found</div>`;
+    }
+    html += `</div>`;
+
+    // GroupKeyMap
+    html += `<div class="data-section">
+      <div class="data-section-title">GroupKeyMap (${data.group_key_map?.length || 0})</div>`;
+
+    if (data.group_key_map && data.group_key_map.length > 0) {
+      html += `<table class="data-table">
+        <tr>
+          <th>Index</th>
+          <th>Group ID</th>
+          <th>KeySet Index</th>
+          <th></th>
+        </tr>`;
+
+      for (const entry of data.group_key_map) {
+        html += `<tr>
+          <td>${entry.index}</td>
+          <td>${entry.group_id}</td>
+          <td>${entry.group_key_set_id}</td>
+          <td>
+            <button class="btn btn-small btn-danger" 
+                    data-action="delete-gkm"
+                    data-node-id="${nodeId}"
+                    data-index="${entry.index}">Delete</button>
+          </td>
+        </tr>`;
+      }
+      html += `</table>`;
+    } else {
+      html += `<div class="empty-state">No GroupKeyMap entries found</div>`;
+    }
+    html += `</div>`;
+
+    return html;
+  }
+
+  _renderConfirmDialog() {
+    const { message } = this._confirmDialog;
+    return `
+      <div class="dialog-overlay">
+        <div class="dialog">
+          <div class="dialog-title">⚠️ Confirm Delete</div>
+          <div class="dialog-message">${this._escapeHtml(message)}</div>
+          <div class="dialog-warning">This action cannot be undone. The resource will be removed from the device.</div>
+          <div class="dialog-actions">
+            <button class="btn btn-secondary" data-action="cancel-delete">Cancel</button>
+            <button class="btn btn-danger" data-action="confirm-delete">Delete</button>
+          </div>
+        </div>
+      </div>
+    `;
   }
 
   _renderDetailPanel() {

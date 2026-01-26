@@ -14,9 +14,11 @@
     "step": {
       "init": {
         "data": {
+          "enable_debug_panel": "Enable debug inspector (advanced)",
           "enable_group_bindings": "Create group bindings (experimental)"
         },
         "data_description": {
+          "enable_debug_panel": "When enabled, shows the Debug Inspector tab which allows viewing and deleting raw ACLs, bindings, groups, and group keys on any Matter device. Use with caution as deleting resources can break device communication.",
           "enable_group_bindings": "When enabled, automations with multiple targets will use Matter Groups for efficient multicast. When disabled, individual unicast bindings are created to each target."
         },
         "description": "Configure Matter AutoBind settings.",

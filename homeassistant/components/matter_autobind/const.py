@@ -33,6 +33,14 @@ WS_TYPE_SET_BINDING_PREFERENCE: Final = f"{DOMAIN}/set_binding_preference"
 WS_TYPE_GET_NODE_RAW_DATA: Final = f"{DOMAIN}/get_node_raw_data"
 WS_TYPE_DELETE_RESOURCE: Final = f"{DOMAIN}/delete_resource"
 WS_TYPE_FORCE_RECONCILE: Final = f"{DOMAIN}/force_reconcile"
+# Debug panel commands
+WS_TYPE_GET_DEBUG_CONFIG: Final = f"{DOMAIN}/get_debug_config"
+WS_TYPE_GET_MATTER_DEVICES: Final = f"{DOMAIN}/get_matter_devices"
+WS_TYPE_GET_DEVICE_RAW_DATA: Final = f"{DOMAIN}/get_device_raw_data"
+WS_TYPE_DELETE_ACL_ENTRY: Final = f"{DOMAIN}/delete_acl_entry"
+WS_TYPE_DELETE_BINDING_ENTRY: Final = f"{DOMAIN}/delete_binding_entry"
+WS_TYPE_DELETE_GROUP_ENTRY: Final = f"{DOMAIN}/delete_group_entry"
+WS_TYPE_DELETE_GROUP_KEY_MAP_ENTRY: Final = f"{DOMAIN}/delete_group_key_map_entry"
 
 # Configuration options (for config_flow.py)
 CONF_ENABLE_DEBUG_PANEL: Final = "enable_debug_panel"
