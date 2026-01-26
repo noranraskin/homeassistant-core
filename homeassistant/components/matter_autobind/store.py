@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import TypedDict
+from typing import Any, TypedDict
 
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.storage import Store
@@ -22,6 +22,19 @@ from .const import (
     STORAGE_KEY,
     STORAGE_VERSION,
 )
+
+# =============================================================================
+# Resource Type Enum
+# =============================================================================
+
+
+class ResourceType(StrEnum):
+    """Type of managed resource."""
+
+    ACL = "acl"
+    BINDING = "binding"
+    GROUP = "group"
+
 
 # =============================================================================
 # Eligibility Status
@@ -523,6 +536,81 @@ class MatterBindingStore:
         return group_resource["group_id"] if group_resource else None
 
     # =========================================================================
+    # Generic Resource Helpers
+    # =========================================================================
+
+    def _get_resource_store(self, resource_type: ResourceType) -> dict[str, Any]:
+        """Get the resource dictionary for a given resource type."""
+        match resource_type:
+            case ResourceType.ACL:
+                return self._data.acl_resources
+            case ResourceType.BINDING:
+                return self._data.binding_resources
+            case ResourceType.GROUP:
+                return self._data.group_resources
+
+    def _get_automation_keys_list(
+        self, automation_id: str, resource_type: ResourceType
+    ) -> list[str]:
+        """Get the list of keys for a resource type in automation resources."""
+        resources = self._data.automation_resources.get(automation_id)
+        if not resources:
+            return []
+        match resource_type:
+            case ResourceType.ACL:
+                return resources["acl_keys"]
+            case ResourceType.BINDING:
+                return resources["binding_keys"]
+            case ResourceType.GROUP:
+                return resources["group_keys"]
+
+    def _release_resource(
+        self,
+        automation_id: str,
+        key: str,
+        resource_type: ResourceType,
+    ) -> bool:
+        """Generic release logic for reference-counted resources.
+
+        Args:
+            automation_id: The automation releasing this resource.
+            key: The resource key.
+            resource_type: Type of resource (ACL, BINDING, GROUP).
+
+        Returns:
+            True if resource should be removed from device (ref_count reached 0).
+        """
+        store = self._get_resource_store(resource_type)
+        if key not in store:
+            return False
+
+        resource = store[key]
+        resource["ref_count"] -= 1
+        if automation_id in resource["automation_ids"]:
+            resource["automation_ids"].remove(automation_id)
+
+        # Remove from automation's resource list
+        keys_list = self._get_automation_keys_list(automation_id, resource_type)
+        if key in keys_list:
+            keys_list.remove(key)
+
+        should_remove = resource["ref_count"] <= 0
+        if should_remove:
+            del store[key]
+            LOGGER.debug(
+                "%s %s removed (ref_count=0)", resource_type.value.upper(), key
+            )
+        else:
+            LOGGER.debug(
+                "%s %s ref_count decremented to %d",
+                resource_type.value.upper(),
+                key,
+                resource["ref_count"],
+            )
+
+        return should_remove
+
+    # =========================================================================
     # ACL Resource Management (Reference Counted)
     # =========================================================================
 
@@ -594,30 +682,7 @@ class MatterBindingStore:
         Returns:
             True if resource should be removed from device (ref_count reached 0).
         """
-        if key not in self._data.acl_resources:
-            return False
-
-        resource = self._data.acl_resources[key]
-        resource["ref_count"] -= 1
-        if automation_id in resource["automation_ids"]:
-            resource["automation_ids"].remove(automation_id)
-
-        # Remove from automation's resource list
-        if automation_id in self._data.automation_resources:
-            acl_keys = self._data.automation_resources[automation_id]["acl_keys"]
-            if key in acl_keys:
-                acl_keys.remove(key)
-
-        should_remove = resource["ref_count"] <= 0
-        if should_remove:
-            del self._data.acl_resources[key]
-            LOGGER.debug("ACL %s removed (ref_count=0)", key)
-        else:
-            LOGGER.debug(
-                "ACL %s ref_count decremented to %d", key, resource["ref_count"]
-            )
-
-        return should_remove
+        return self._release_resource(automation_id, key, ResourceType.ACL)
 
     # =========================================================================
     # Binding Resource Management (Reference Counted)
@@ -703,32 +768,7 @@ class MatterBindingStore:
         Returns:
             True if resource should be removed from device (ref_count reached 0).
         """
-        if key not in self._data.binding_resources:
-            return False
-
-        resource = self._data.binding_resources[key]
-        resource["ref_count"] -= 1
-        if automation_id in resource["automation_ids"]:
-            resource["automation_ids"].remove(automation_id)
-
-        # Remove from automation's resource list
-        if automation_id in self._data.automation_resources:
-            binding_keys = self._data.automation_resources[automation_id][
-                "binding_keys"
-            ]
-            if key in binding_keys:
-                binding_keys.remove(key)
-
-        should_remove = resource["ref_count"] <= 0
-        if should_remove:
-            del self._data.binding_resources[key]
-            LOGGER.debug("Binding %s removed (ref_count=0)", key)
-        else:
-            LOGGER.debug(
-                "Binding %s ref_count decremented to %d", key, resource["ref_count"]
-            )
-
-        return should_remove
+        return self._release_resource(automation_id, key, ResourceType.BINDING)
 
     # =========================================================================
     # Group Resource Management (Reference Counted)
@@ -806,6 +846,36 @@ class MatterBindingStore:
 
         return key, is_new
 
+    def _update_group_field(
+        self,
+        key: str,
+        fld: str,
+        value: Any,
+        log_value: str | None = None,
+    ) -> bool:
+        """Update a single field on a group resource.
+
+        Args:
+            key: The group resource key.
+            fld: The field name to update.
+            value: The new value.
+            log_value: Optional custom value for logging (e.g., truncated key).
+
+        Returns:
+            True if update was successful, False if group not found.
+        """
+        if key not in self._data.group_resources:
+            return False
+
+        self._data.group_resources[key][fld] = value  # type: ignore[literal-required]
+        LOGGER.debug(
+            "Group %s %s updated to %s",
+            key,
+            fld,
+            log_value if log_value is not None else value,
+        )
+        return True
+
     def update_group_epoch_key(
         self,
         key: str,
@@ -819,16 +889,9 @@ class MatterBindingStore:
             epoch_key: Hex-encoded 16-byte epoch key.
             key_set_index: Key set index (1-3).
         """
-        if key not in self._data.group_resources:
-            return
-
-        self._data.group_resources[key]["epoch_key"] = epoch_key
-        self._data.group_resources[key]["key_set_index"] = key_set_index
-        LOGGER.debug(
-            "Group %s epoch_key updated (key=%s...)",
-            key,
-            epoch_key[:8] if epoch_key else None,
-        )
+        truncated_key = epoch_key[:8] + "..." if epoch_key else None
+        self._update_group_field(key, "epoch_key", epoch_key, truncated_key)
+        self._update_group_field(key, "key_set_index", key_set_index)
 
     def update_group_source_nodes(
         self,
@@ -841,15 +904,7 @@ class MatterBindingStore:
             key: The group resource key.
             source_nodes: List of source node IDs with GroupKeyMap.
         """
-        if key not in self._data.group_resources:
-            return
-
-        self._data.group_resources[key]["source_nodes"] = source_nodes
-        LOGGER.debug(
-            "Group %s source_nodes updated to %s",
-            key,
-            source_nodes,
-        )
+        self._update_group_field(key, "source_nodes", source_nodes)
 
     def release_group(self, automation_id: str, key: str) -> bool:
         """Release a group resource, decrementing ref count.
@@ -861,30 +916,7 @@ class MatterBindingStore:
         Returns:
             True if resource should be removed from devices (ref_count reached 0).
         """
-        if key not in self._data.group_resources:
-            return False
-
-        resource = self._data.group_resources[key]
-        resource["ref_count"] -= 1
-        if automation_id in resource["automation_ids"]:
-            resource["automation_ids"].remove(automation_id)
-
-        # Remove from automation's resource list
-        if automation_id in self._data.automation_resources:
-            group_keys = self._data.automation_resources[automation_id]["group_keys"]
-            if key in group_keys:
-                group_keys.remove(key)
-
-        should_remove = resource["ref_count"] <= 0
-        if should_remove:
-            del self._data.group_resources[key]
-            LOGGER.debug("Group %s removed (ref_count=0)", key)
-        else:
-            LOGGER.debug(
-                "Group %s ref_count decremented to %d", key, resource["ref_count"]
-            )
-
-        return should_remove
+        return self._release_resource(automation_id, key, ResourceType.GROUP)
 
     def update_group_members(
         self,
