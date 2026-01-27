@@ -41,6 +41,7 @@ WS_TYPE_DELETE_ACL_ENTRY: Final = f"{DOMAIN}/delete_acl_entry"
 WS_TYPE_DELETE_BINDING_ENTRY: Final = f"{DOMAIN}/delete_binding_entry"
 WS_TYPE_DELETE_GROUP_ENTRY: Final = f"{DOMAIN}/delete_group_entry"
 WS_TYPE_DELETE_GROUP_KEY_MAP_ENTRY: Final = f"{DOMAIN}/delete_group_key_map_entry"
+WS_TYPE_DELETE_GROUP_KEY_SET: Final = f"{DOMAIN}/delete_group_key_set"
 
 # Configuration options (for config_flow.py)
 CONF_ENABLE_DEBUG_PANEL: Final = "enable_debug_panel"

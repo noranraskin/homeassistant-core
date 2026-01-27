@@ -4,17 +4,21 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from homeassistant.components.light import ColorMode, LightEntity
+from homeassistant.components.light import (
+    ColorMode,
+    LightEntity,
+    LightEntityDescription,
+)
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
 from .const import DOMAIN
-from .entity import ClientClusterEntity, ClientClusterEntityDescription
+from .entity import ClientClusterEntity
 
 
 @dataclass(frozen=True, kw_only=True)
-class ClientLightEntityDescription(ClientClusterEntityDescription):
+class ClientLightEntityDescription(LightEntityDescription):
     """Describe a client cluster light entity."""
 
 

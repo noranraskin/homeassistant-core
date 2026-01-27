@@ -4,17 +4,21 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from homeassistant.components.switch import SwitchDeviceClass, SwitchEntity
+from homeassistant.components.switch import (
+    SwitchDeviceClass,
+    SwitchEntity,
+    SwitchEntityDescription,
+)
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
 from .const import DOMAIN
-from .entity import ClientClusterEntity, ClientClusterEntityDescription
+from .entity import ClientClusterEntity
 
 
 @dataclass(frozen=True, kw_only=True)
-class ClientSwitchEntityDescription(ClientClusterEntityDescription):
+class ClientSwitchEntityDescription(SwitchEntityDescription):
     """Describe a client cluster switch entity."""
 
 

@@ -19,6 +19,7 @@ from .const import (
     WS_TYPE_DELETE_BINDING_ENTRY,
     WS_TYPE_DELETE_GROUP_ENTRY,
     WS_TYPE_DELETE_GROUP_KEY_MAP_ENTRY,
+    WS_TYPE_DELETE_GROUP_KEY_SET,
     WS_TYPE_DELETE_RESOURCE,
     WS_TYPE_FORCE_RECONCILE,
     WS_TYPE_GET_AUTOMATION_DETAIL,
@@ -51,6 +52,7 @@ def async_register_websocket_commands(hass: HomeAssistant) -> None:
     websocket_api.async_register_command(hass, ws_delete_binding_entry)
     websocket_api.async_register_command(hass, ws_delete_group_entry)
     websocket_api.async_register_command(hass, ws_delete_group_key_map_entry)
+    websocket_api.async_register_command(hass, ws_delete_group_key_set)
 
 
 def _get_runtime_data(hass: HomeAssistant) -> MatterAutoBindData | None:
@@ -452,6 +454,7 @@ async def ws_get_matter_devices(
     {
         vol.Required("type"): WS_TYPE_GET_DEVICE_RAW_DATA,
         vol.Required("node_id"): vol.Coerce(int),
+        vol.Optional("force_refresh", default=False): bool,
     }
 )
 @websocket_api.require_admin
@@ -465,6 +468,11 @@ async def ws_get_device_raw_data(
 
     Returns ALL ACLs, bindings, groups, group keys, and group key maps.
     Only available to admin users with debug panel enabled.
+
+    Args:
+        force_refresh: If True, fetch live data from the device instead of
+            using cached data. Defaults to False for performance.
+
     """
     if not _is_debug_enabled(hass):
         connection.send_error(
@@ -484,7 +492,10 @@ async def ws_get_device_raw_data(
         return
 
     try:
-        data = await runtime_data.manager.get_device_raw_data(msg["node_id"])
+        data = await runtime_data.manager.get_device_raw_data(
+            msg["node_id"],
+            force_refresh=msg.get("force_refresh", False),
+        )
         connection.send_result(msg["id"], data)
     except Exception as err:  # noqa: BLE001
         LOGGER.exception("Error getting device raw data")
@@ -690,4 +701,55 @@ async def ws_delete_group_key_map_entry(
         connection.send_result(msg["id"], {"success": success})
     except Exception as err:  # noqa: BLE001
         LOGGER.exception("Error deleting GroupKeyMap entry")
+        connection.send_error(msg["id"], "error", str(err))
+
+
+# =============================================================================
+# Debug Panel: Delete GroupKeySet
+# =============================================================================
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): WS_TYPE_DELETE_GROUP_KEY_SET,
+        vol.Required("node_id"): vol.Coerce(int),
+        vol.Required("key_set_id"): vol.Coerce(int),
+    }
+)
+@websocket_api.require_admin
+@websocket_api.async_response
+async def ws_delete_group_key_set(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Delete a GroupKeySet by its KeySetId.
+
+    Uses the KeySetRemove command to remove the key set from the device.
+    Only available to admin users with debug panel enabled.
+    """
+    if not _is_debug_enabled(hass):
+        connection.send_error(
+            msg["id"],
+            "debug_disabled",
+            "Debug panel is not enabled in integration settings",
+        )
+        return
+
+    runtime_data = _get_runtime_data(hass)
+    if runtime_data is None:
+        connection.send_error(
+            msg["id"],
+            "not_loaded",
+            "Matter AutoBind integration not loaded",
+        )
+        return
+
+    try:
+        success = await runtime_data.manager.delete_group_key_set(
+            msg["node_id"], msg["key_set_id"]
+        )
+        connection.send_result(msg["id"], {"success": success})
+    except Exception as err:  # noqa: BLE001
+        LOGGER.exception("Error deleting GroupKeySet")
         connection.send_error(msg["id"], "error", str(err))

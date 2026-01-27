@@ -126,6 +126,12 @@ class MatterAutoBindPanel extends HTMLElement {
             entry_index: parseInt(target.dataset.index, 10),
           });
           break;
+        case "delete-gks":
+          this._showDeleteConfirmation("group_key_set", {
+            node_id: nodeId,
+            key_set_id: parseInt(target.dataset.keySetId, 10),
+          });
+          break;
         case "confirm-delete":
           this._executeDelete();
           break;
@@ -244,7 +250,7 @@ class MatterAutoBindPanel extends HTMLElement {
     this._render();
   }
 
-  async _loadDeviceRawData(nodeId) {
+  async _loadDeviceRawData(nodeId, forceRefresh = false) {
     this._selectedDevice = nodeId;
     this._deviceRawData = null;
     this._deviceLoading = true;
@@ -253,10 +259,14 @@ class MatterAutoBindPanel extends HTMLElement {
     try {
       const result = await this._callService(
         "matter_autobind/get_device_raw_data",
-        { node_id: nodeId },
+        { node_id: nodeId, force_refresh: forceRefresh },
       );
       this._deviceRawData = result;
       this._deviceLoading = false;
+      // Show warning if we got cached data when refresh was requested
+      if (forceRefresh && result.from_cache) {
+        console.warn(`Node ${nodeId} may be offline - showing cached data`);
+      }
     } catch (err) {
       this._deviceRawData = {
         error: err.message || "Failed to load device data",
@@ -280,6 +290,9 @@ class MatterAutoBindPanel extends HTMLElement {
         break;
       case "group_key_map":
         message = `Delete GroupKeyMap entry at index ${params.entry_index} from node ${params.node_id}?`;
+        break;
+      case "group_key_set":
+        message = `Delete GroupKeySet ${params.key_set_id} from node ${params.node_id}?`;
         break;
     }
     this._confirmDialog = { type, params, message };
@@ -308,11 +321,14 @@ class MatterAutoBindPanel extends HTMLElement {
         case "group_key_map":
           serviceType = "matter_autobind/delete_group_key_map_entry";
           break;
+        case "group_key_set":
+          serviceType = "matter_autobind/delete_group_key_set";
+          break;
       }
       await this._callService(serviceType, params);
-      // Refresh device data
+      // Refresh device data with force_refresh to get live data after delete
       if (this._selectedDevice) {
-        await this._loadDeviceRawData(this._selectedDevice);
+        await this._loadDeviceRawData(this._selectedDevice, true);
       }
     } catch (err) {
       alert("Delete failed: " + err.message);
@@ -693,6 +709,14 @@ class MatterAutoBindPanel extends HTMLElement {
           padding: 32px;
           color: var(--secondary-text-color);
         }
+        .cache-warning {
+          background-color: var(--warning-color, #ff9800);
+          color: white;
+          padding: 8px 12px;
+          border-radius: 4px;
+          margin-top: 16px;
+          font-size: 0.9em;
+        }
       </style>
 
       <div class="panel-header">
@@ -1017,6 +1041,47 @@ class MatterAutoBindPanel extends HTMLElement {
       html += `<div class="empty-state">No GroupKeyMap entries found</div>`;
     }
     html += `</div>`;
+
+    // GroupKeySets
+    html += `<div class="data-section">
+      <div class="data-section-title">GroupKeySets (${data.group_key_sets?.length || 0})</div>`;
+
+    if (data.group_key_sets && data.group_key_sets.length > 0) {
+      html += `<table class="data-table">
+        <tr>
+          <th>KeySet ID</th>
+          <th>Security Policy</th>
+          <th>Epochs</th>
+          <th></th>
+        </tr>`;
+
+      for (const keySet of data.group_key_sets) {
+        const policy = keySet.group_key_security_policy || "-";
+        const epochInfo = keySet.epoch_keys?.length
+          ? `${keySet.epoch_keys.length} key(s)`
+          : "-";
+        html += `<tr>
+          <td>${keySet.group_key_set_id}</td>
+          <td>${this._escapeHtml(policy)}</td>
+          <td>${this._escapeHtml(epochInfo)}</td>
+          <td>
+            <button class="btn btn-small btn-danger" 
+                    data-action="delete-gks"
+                    data-node-id="${nodeId}"
+                    data-key-set-id="${keySet.group_key_set_id}">Delete</button>
+          </td>
+        </tr>`;
+      }
+      html += `</table>`;
+    } else {
+      html += `<div class="empty-state">No GroupKeySets found</div>`;
+    }
+    html += `</div>`;
+
+    // Show cache status indicator
+    if (data.from_cache) {
+      html += `<div class="cache-warning">⚠️ Showing cached data - node may be offline</div>`;
+    }
 
     return html;
   }

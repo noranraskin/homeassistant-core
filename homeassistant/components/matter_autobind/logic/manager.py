@@ -1755,6 +1755,32 @@ class MatterBindingManager:
             pass
         return None
 
+    def _get_cluster_attribute_by_name(
+        self, cluster: Any, cluster_id: int
+    ) -> Any | None:
+        """Get cluster attribute value by trying common attribute names.
+
+        Args:
+            cluster: The cluster object.
+            cluster_id: The cluster ID to determine which attributes to try.
+
+        Returns:
+            The attribute value or None if not found.
+        """
+        attr_names: dict[int, str | tuple[str, ...]] = {
+            31: "acl",  # AccessControl
+            30: "binding",  # Binding
+            63: ("groupKeyMap", "groupTable"),  # GroupKeyManagement
+            4: "nameSupport",  # Groups
+        }
+        names_to_try = attr_names.get(cluster_id, ())
+        if isinstance(names_to_try, str):
+            names_to_try = (names_to_try,)
+        for name in names_to_try:
+            if hasattr(cluster, name):
+                return getattr(cluster, name)
+        return None
+
     def _read_cluster_from_cache(
         self, node: Any, endpoint_id: int, cluster_id: int, attribute_id: int = 0
     ) -> Any | None:
@@ -1794,45 +1820,39 @@ class MatterBindingManager:
             if hasattr(endpoint, "get_cluster"):
                 try:
                     cluster = endpoint.get_cluster(cluster_id)
-                    if cluster is not None:
-                        # Try common attribute names based on cluster type
-                        attr_names = {
-                            31: "acl",  # AccessControl
-                            30: "binding",  # Binding
-                            63: ("groupKeyMap", "groupTable"),  # GroupKeyManagement
-                            4: "nameSupport",  # Groups
-                        }
-                        names_to_try = attr_names.get(cluster_id, ())
-                        if isinstance(names_to_try, str):
-                            names_to_try = (names_to_try,)
-                        for name in names_to_try:
-                            if hasattr(cluster, name):
-                                return getattr(cluster, name)
+                    if cluster is None:
+                        pass
+                    elif value := self._get_cluster_attribute_by_name(
+                        cluster, cluster_id
+                    ):
+                        return value
                 except Exception:  # noqa: BLE001
                     pass
 
             # Method 3: Try accessing clusters dict directly
             if hasattr(endpoint, "clusters"):
                 clusters = endpoint.clusters
-                if isinstance(clusters, dict):
-                    cluster = clusters.get(cluster_id)
-                    if cluster is not None:
-                        # Try to get the attribute
-                        if hasattr(cluster, "get"):
-                            value = cluster.get(attribute_id)
-                            if value is not None:
-                                return value
+                if isinstance(clusters, dict) and (cluster := clusters.get(cluster_id)):
+                    if hasattr(cluster, "get"):
+                        value = cluster.get(attribute_id)
+                        if value is not None:
+                            return value
 
         except Exception as err:  # noqa: BLE001
             LOGGER.debug("Error reading cluster from cache: %s", err)
 
         return None
 
-    async def get_device_raw_data(self, node_id: int) -> dict[str, Any]:
+    async def get_device_raw_data(
+        self, node_id: int, force_refresh: bool = False
+    ) -> dict[str, Any]:
         """Get comprehensive raw Matter cluster data from a device.
 
-        This reads from the Matter client's cached node model, which is available
-        even when nodes are offline. The cache is updated when nodes communicate.
+        By default, reads from the Matter client's cached node model, which is
+        available even when nodes are offline.
+
+        When force_refresh=True, reads live data from the device and updates
+        the cache. This is useful after making changes to verify they took effect.
 
         Reads these clusters:
         - ACL (AccessControl cluster, endpoint 0, cluster 31)
@@ -1841,12 +1861,11 @@ class MatterBindingManager:
 
         Args:
             node_id: The Matter node ID.
+            force_refresh: If True, read live from device instead of cache.
 
         Returns:
             Dict with all cluster data and parsed entries.
         """
-        LOGGER.info("Getting comprehensive raw data for node %d (from cache)", node_id)
-
         result: dict[str, Any] = {
             "node_id": node_id,
             "acls": [],
@@ -1855,8 +1874,20 @@ class MatterBindingManager:
             "group_key_sets": [],
             "group_key_map": [],
             "errors": [],
+            "from_cache": not force_refresh,
         }
 
+        if force_refresh:
+            LOGGER.debug("Reading live data from node %d", node_id)
+            return await self._get_device_raw_data_live(node_id, result)
+
+        LOGGER.debug("Reading cached data for node %d", node_id)
+        return self._get_device_raw_data_cached(node_id, result)
+
+    def _get_device_raw_data_cached(
+        self, node_id: int, result: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Get device raw data from cache."""
         # Get the node from cache
         node = self._get_matter_node(node_id)
         if node is None:
@@ -1897,6 +1928,97 @@ class MatterBindingManager:
         group_table = self._read_cluster_from_cache(node, 0, 63, 1)
         if group_table is not None:
             result["groups"] = self._parse_group_table(group_table)
+
+        return result
+
+    async def _get_device_raw_data_live(
+        self, node_id: int, result: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Get device raw data by reading live from the device."""
+        try:
+            matter_client = self._adapter._get_matter_client()  # noqa: SLF001
+        except RuntimeError:
+            result["errors"].append("Matter integration not available")
+            return result
+
+        # Read ACL cluster (endpoint 0, cluster 31)
+        try:
+            acl_resp = await matter_client.read_attribute(node_id, "0/31/0")
+            acl_data = acl_resp.get("0/31/0", [])
+            result["acls"] = self._parse_acl_list(acl_data)
+        except (HomeAssistantError, OSError, ValueError) as err:
+            result["errors"].append(f"Failed to read ACLs: {err}")
+
+        # Read Bindings from endpoint 1 (most common)
+        for endpoint_id in (1, 2, 3, 0):
+            try:
+                binding_path = f"{endpoint_id}/30/0"
+                binding_resp = await matter_client.read_attribute(node_id, binding_path)
+                binding_data = binding_resp.get(binding_path, [])
+                if binding_data:
+                    parsed = self._parse_binding_list(binding_data, endpoint_id)
+                    if parsed:
+                        result["bindings"].extend(parsed)
+            except (HomeAssistantError, OSError, ValueError):
+                pass  # Endpoint may not exist or have binding cluster
+
+        # Read GroupKeyManagement cluster (endpoint 0, cluster 63)
+        # Attribute 0 = GroupKeyMap
+        try:
+            gkm_resp = await matter_client.read_attribute(node_id, "0/63/0")
+            gkm_data = gkm_resp.get("0/63/0", [])
+            result["group_key_map"] = self._parse_group_key_map(gkm_data)
+        except (HomeAssistantError, OSError, ValueError) as err:
+            result["errors"].append(f"Failed to read GroupKeyMap: {err}")
+
+        # GroupTable (attribute 1)
+        try:
+            gt_resp = await matter_client.read_attribute(node_id, "0/63/1")
+            gt_data = gt_resp.get("0/63/1", [])
+            result["groups"] = self._parse_group_table(gt_data)
+        except (HomeAssistantError, OSError, ValueError) as err:
+            result["errors"].append(f"Failed to read GroupTable: {err}")
+
+        # Read KeySets - need to enumerate via GroupKeyMap entries
+        # KeySets are accessed via KeySetRead command, not attribute
+        key_set_ids = set()
+        for entry in result["group_key_map"]:
+            if entry.get("group_key_set_id") is not None:
+                key_set_ids.add(entry["group_key_set_id"])
+
+        for key_set_id in key_set_ids:
+            try:
+                key_set_resp = await matter_client.send_device_command(
+                    node_id=node_id,
+                    endpoint_id=0,
+                    command=Clusters.GroupKeyManagement.Commands.KeySetRead(
+                        groupKeySetID=key_set_id
+                    ),
+                )
+                if key_set_resp:
+                    result["group_key_sets"].append(
+                        self._parse_key_set_response(key_set_id, key_set_resp)
+                    )
+            except (HomeAssistantError, OSError, ValueError) as err:
+                LOGGER.debug("Failed to read KeySet %d: %s", key_set_id, err)
+
+        return result
+
+    def _parse_key_set_response(self, key_set_id: int, response: Any) -> dict[str, Any]:
+        """Parse a KeySetRead response."""
+        result: dict[str, Any] = {
+            "key_set_id": key_set_id,
+        }
+
+        if hasattr(response, "groupKeySet"):
+            key_set = response.groupKeySet
+            result["security_policy"] = getattr(key_set, "groupKeySecurityPolicy", None)
+            result["epoch_key0_present"] = (
+                getattr(key_set, "epochKey0", None) is not None
+            )
+            result["epoch_start_time0"] = getattr(key_set, "epochStartTime0", None)
+        elif isinstance(response, dict):
+            result["raw"] = response
 
         return result
 
@@ -2255,6 +2377,45 @@ class MatterBindingManager:
 
         except (HomeAssistantError, OSError, ValueError) as err:
             LOGGER.error("Failed to delete GroupKeyMap entry: %s", err)
+            return False
+        else:
+            return True
+
+    async def delete_group_key_set(self, node_id: int, key_set_id: int) -> bool:
+        """Delete a GroupKeySet by ID using the KeySetRemove command.
+
+        Note: KeySet 0 (IPK) cannot be removed.
+
+        Args:
+            node_id: The Matter node ID.
+            key_set_id: The KeySet ID to remove.
+
+        Returns:
+            True if deletion succeeded.
+        """
+        if key_set_id == 0:
+            LOGGER.error("Cannot remove KeySet 0 (IPK)")
+            return False
+
+        LOGGER.warning(
+            "Deleting GroupKeySet: node=%d, key_set_id=%d",
+            node_id,
+            key_set_id,
+        )
+
+        try:
+            matter_client = self._adapter._get_matter_client()  # noqa: SLF001
+            await matter_client.send_device_command(
+                node_id=node_id,
+                endpoint_id=0,
+                command=Clusters.GroupKeyManagement.Commands.KeySetRemove(
+                    groupKeySetID=key_set_id
+                ),
+            )
+            LOGGER.info("Deleted GroupKeySet %d from node %d", key_set_id, node_id)
+
+        except (HomeAssistantError, OSError, ValueError) as err:
+            LOGGER.error("Failed to delete GroupKeySet: %s", err)
             return False
         else:
             return True

@@ -75,8 +75,6 @@ class ClientClusterEntity(Entity):
     _attr_should_poll = False
     _attr_available = False  # Always unavailable - represents client capability
 
-    entity_description: ClientClusterEntityDescription
-
     def __init__(
         self,
         matter_client: MatterClient,
