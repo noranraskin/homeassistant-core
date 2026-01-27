@@ -363,12 +363,12 @@ class MatterBindingStore:
 
         # Check for debug reset flag BEFORE loading
         if DEBUG_RESET_STORE:
-            LOGGER.warning("⚠️ DEBUG_RESET_STORE is enabled! Wiping all store data")
+            LOGGER.warning("DEBUG_RESET_STORE is enabled! Wiping all store data")
             self._data = MatterBindingStoreData()
             self._loaded = True
             await self.async_save()
             LOGGER.warning(
-                "⚠️ Store has been reset. Set DEBUG_RESET_STORE=False and restart"
+                "Store has been reset. Set DEBUG_RESET_STORE=False and restart"
             )
             return
 

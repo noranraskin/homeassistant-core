@@ -345,7 +345,7 @@ class MatterAdapter:
             Cleaned ACL list.
         """
         self._logger.warning(
-            "⚠️ DEBUG_OVERWRITE_ACLS: Cleaning up ACLs on node %d", node_id
+            "DEBUG_OVERWRITE_ACLS: Cleaning up ACLs on node %d", node_id
         )
         cleaned_entries: list[dict[str, Any]] = []
         seen_acls: set[tuple[int, int, tuple[int, ...]]] = set()

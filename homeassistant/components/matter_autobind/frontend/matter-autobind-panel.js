@@ -62,9 +62,10 @@ class MatterAutoBindPanel extends HTMLElement {
 
       const action = target.dataset.action;
       const automationId = target.dataset.automationId;
+      // Get nodeId from button, or fall back to currently selected device
       const nodeId = target.dataset.nodeId
         ? parseInt(target.dataset.nodeId, 10)
-        : null;
+        : this._selectedDevice;
 
       switch (action) {
         case "refresh":
@@ -958,15 +959,15 @@ class MatterAutoBindPanel extends HTMLElement {
           : `Node ${binding.node_id || "?"}`;
         html += `<tr>
           <td>${binding.index}</td>
-          <td>${binding.source_endpoint}</td>
+          <td>${binding.endpoint}</td>
           <td class="mono">${this._escapeHtml(target)}</td>
-          <td>${binding.endpoint || "-"}</td>
-          <td class="mono">${binding.cluster || "-"}</td>
+          <td>${binding.target_endpoint || "-"}</td>
+          <td class="mono">${binding.cluster_id || "-"}</td>
           <td>
             <button class="btn btn-small btn-danger" 
                     data-action="delete-binding"
                     data-node-id="${nodeId}"
-                    data-endpoint="${binding.source_endpoint}"
+                    data-endpoint="${binding.endpoint}"
                     data-index="${binding.index}">Delete</button>
           </td>
         </tr>`;
@@ -985,21 +986,28 @@ class MatterAutoBindPanel extends HTMLElement {
       html += `<table class="data-table">
         <tr>
           <th>Group ID</th>
-          <th>Endpoint</th>
+          <th>Endpoints</th>
           <th>Name</th>
           <th></th>
         </tr>`;
 
       for (const group of data.groups) {
+        const endpointList = Array.isArray(group.endpoints)
+          ? group.endpoints.join(", ")
+          : group.endpoints || "-";
+        const endpoint =
+          Array.isArray(group.endpoints) && group.endpoints.length > 0
+            ? group.endpoints[0]
+            : 1;
         html += `<tr>
           <td>${group.group_id}</td>
-          <td>${group.endpoint}</td>
-          <td>${this._escapeHtml(group.name || "-")}</td>
+          <td>${endpointList}</td>
+          <td>${this._escapeHtml(group.group_name || "-")}</td>
           <td>
             <button class="btn btn-small btn-danger" 
                     data-action="delete-group"
                     data-node-id="${nodeId}"
-                    data-endpoint="${group.endpoint}"
+                    data-endpoint="${endpoint}"
                     data-group-id="${group.group_id}">Remove</button>
           </td>
         </tr>`;
@@ -1080,7 +1088,7 @@ class MatterAutoBindPanel extends HTMLElement {
 
     // Show cache status indicator
     if (data.from_cache) {
-      html += `<div class="cache-warning">⚠️ Showing cached data - node may be offline</div>`;
+      html += `<div class="cache-warning">Showing cached data - node may be offline</div>`;
     }
 
     return html;
@@ -1091,7 +1099,7 @@ class MatterAutoBindPanel extends HTMLElement {
     return `
       <div class="dialog-overlay">
         <div class="dialog">
-          <div class="dialog-title">⚠️ Confirm Delete</div>
+          <div class="dialog-title">Confirm Delete</div>
           <div class="dialog-message">${this._escapeHtml(message)}</div>
           <div class="dialog-warning">This action cannot be undone. The resource will be removed from the device.</div>
           <div class="dialog-actions">

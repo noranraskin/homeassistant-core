@@ -1934,75 +1934,56 @@ class MatterBindingManager:
     async def _get_device_raw_data_live(
         self, node_id: int, result: dict[str, Any]
     ) -> dict[str, Any]:
-        """Get device raw data by reading live from the device."""
+        """Get device raw data by triggering a node interview/refresh.
+
+        IMPORTANT: We do NOT use read_attribute here because it triggers
+        subscription updates in the matter server that can crash the HA
+        matter integration when there are phantom/invalid endpoints or
+        None values in the server's cache.
+
+        Instead, we:
+        1. Request a fresh interview of the node (which updates the cache safely)
+        2. Then return the cached data
+
+        This gives us fresh data without the subscription crash issues.
+        """
         try:
             matter_client = self._adapter._get_matter_client()  # noqa: SLF001
         except RuntimeError:
             result["errors"].append("Matter integration not available")
+            result["from_cache"] = True
+            return self._get_device_raw_data_cached(node_id, result)
+
+        # Check if node is available first
+        node = self._get_matter_node(node_id)
+        if node is None:
+            result["errors"].append(f"Node {node_id} not found")
+            result["from_cache"] = True
             return result
 
-        # Read ACL cluster (endpoint 0, cluster 31)
+        is_available = getattr(node, "available", False)
+        if not is_available:
+            result["errors"].append(f"Node {node_id} is offline - showing cached data")
+            result["from_cache"] = True
+            return self._get_device_raw_data_cached(node_id, result)
+
+        # Try to interview the node to get fresh data
+        # This updates the cache without the subscription crash issues
         try:
-            acl_resp = await matter_client.read_attribute(node_id, "0/31/0")
-            acl_data = acl_resp.get("0/31/0", [])
-            result["acls"] = self._parse_acl_list(acl_data)
-        except (HomeAssistantError, OSError, ValueError) as err:
-            result["errors"].append(f"Failed to read ACLs: {err}")
+            LOGGER.debug("Requesting interview for node %d to refresh data", node_id)
+            await matter_client.interview_node(node_id)
+            # Small delay to let the cache update
 
-        # Read Bindings from endpoint 1 (most common)
-        for endpoint_id in (1, 2, 3, 0):
-            try:
-                binding_path = f"{endpoint_id}/30/0"
-                binding_resp = await matter_client.read_attribute(node_id, binding_path)
-                binding_data = binding_resp.get(binding_path, [])
-                if binding_data:
-                    parsed = self._parse_binding_list(binding_data, endpoint_id)
-                    if parsed:
-                        result["bindings"].extend(parsed)
-            except (HomeAssistantError, OSError, ValueError):
-                pass  # Endpoint may not exist or have binding cluster
+            await asyncio.sleep(0.5)
+        except Exception as err:  # noqa: BLE001
+            LOGGER.debug(
+                "Failed to interview node %d: %s - using cached data", node_id, err
+            )
+            result["errors"].append(f"Could not refresh node: {err}")
 
-        # Read GroupKeyManagement cluster (endpoint 0, cluster 63)
-        # Attribute 0 = GroupKeyMap
-        try:
-            gkm_resp = await matter_client.read_attribute(node_id, "0/63/0")
-            gkm_data = gkm_resp.get("0/63/0", [])
-            result["group_key_map"] = self._parse_group_key_map(gkm_data)
-        except (HomeAssistantError, OSError, ValueError) as err:
-            result["errors"].append(f"Failed to read GroupKeyMap: {err}")
-
-        # GroupTable (attribute 1)
-        try:
-            gt_resp = await matter_client.read_attribute(node_id, "0/63/1")
-            gt_data = gt_resp.get("0/63/1", [])
-            result["groups"] = self._parse_group_table(gt_data)
-        except (HomeAssistantError, OSError, ValueError) as err:
-            result["errors"].append(f"Failed to read GroupTable: {err}")
-
-        # Read KeySets - need to enumerate via GroupKeyMap entries
-        # KeySets are accessed via KeySetRead command, not attribute
-        key_set_ids = set()
-        for entry in result["group_key_map"]:
-            if entry.get("group_key_set_id") is not None:
-                key_set_ids.add(entry["group_key_set_id"])
-
-        for key_set_id in key_set_ids:
-            try:
-                key_set_resp = await matter_client.send_device_command(
-                    node_id=node_id,
-                    endpoint_id=0,
-                    command=Clusters.GroupKeyManagement.Commands.KeySetRead(
-                        groupKeySetID=key_set_id
-                    ),
-                )
-                if key_set_resp:
-                    result["group_key_sets"].append(
-                        self._parse_key_set_response(key_set_id, key_set_resp)
-                    )
-            except (HomeAssistantError, OSError, ValueError) as err:
-                LOGGER.debug("Failed to read KeySet %d: %s", key_set_id, err)
-
-        return result
+        # Now return cached data (which should be fresh after interview)
+        result["from_cache"] = False  # Data was refreshed via interview
+        return self._get_device_raw_data_cached(node_id, result)
 
     def _parse_key_set_response(self, key_set_id: int, response: Any) -> dict[str, Any]:
         """Parse a KeySetRead response."""
@@ -2175,6 +2156,65 @@ class MatterBindingManager:
         }
         return modes.get(auth_mode, f"Unknown({auth_mode})")
 
+    def _acl_entry_to_dict(self, acl_entry: Any) -> dict[str, Any]:
+        """Convert an ACL entry (SDK object or dict) to dict format for writing.
+
+        The Matter SDK expects ACL entries in dict format with specific keys:
+        - privilege: int (1=View, 2=ProxyView, 3=Operate, 4=Manage, 5=Administer)
+        - authMode: int (1=PASE, 2=CASE, 3=Group) # codespell:ignore
+        - subjects: list[int] or None
+        - targets: list[dict] or None
+        - fabricIndex: int (0 = device sets automatically)
+        """
+        if isinstance(acl_entry, dict):
+            # Already a dict, normalize keys
+            # SDK uses both numeric keys ("1", "2") and camelCase keys
+            privilege = acl_entry.get("privilege") or acl_entry.get("1", 3)
+            auth_mode = acl_entry.get("authMode") or acl_entry.get("2", 2)
+            subjects = acl_entry.get("subjects") or acl_entry.get("3")
+            targets = acl_entry.get("targets") or acl_entry.get("4")
+        else:
+            # SDK cluster object
+            privilege = getattr(acl_entry, "privilege", 3)
+            auth_mode = getattr(acl_entry, "authMode", 2)
+            subjects = getattr(acl_entry, "subjects", None)
+            targets = getattr(acl_entry, "targets", None)
+
+        # Convert targets to proper format
+        parsed_targets = None
+        if targets:
+            parsed_targets = []
+            for target in targets:
+                if isinstance(target, dict):
+                    parsed_targets.append(
+                        {
+                            "cluster": target.get("cluster") or target.get("0"),
+                            "endpoint": target.get("endpoint") or target.get("1"),
+                            "deviceType": target.get("deviceType") or target.get("2"),
+                        }
+                    )
+                else:
+                    parsed_targets.append(
+                        {
+                            "cluster": getattr(target, "cluster", None),
+                            "endpoint": getattr(target, "endpoint", None),
+                            "deviceType": getattr(target, "deviceType", None),
+                        }
+                    )
+
+        # Convert subjects to plain Python ints
+        parsed_subjects = None
+        if subjects:
+            parsed_subjects = [int(s) for s in subjects if s is not None]
+
+        return {
+            "privilege": int(privilege) if privilege is not None else 3,
+            "authMode": int(auth_mode) if auth_mode is not None else 2,
+            "subjects": parsed_subjects,
+            "targets": parsed_targets,
+            "fabricIndex": 0,  # Device sets this automatically
+        }
+
     async def delete_acl_entry(self, node_id: int, acl_index: int) -> bool:
         """Delete an ACL entry by index.
 
@@ -2207,21 +2247,110 @@ class MatterBindingManager:
                 )
                 return False
 
-            # Remove the entry at the specified index
-            updated_list = acl_list[:acl_index] + acl_list[acl_index + 1 :]
+            # Determine our fabric index by looking at entries with full data
+            # Entries from other fabrics only show fabricIndex, not full data
+            our_fabric_index: int | None = None
+            for entry in acl_list:
+                # Check if this entry has privilege (key "1" or "privilege")
+                # If it does, it's from our fabric
+                if isinstance(entry, dict):
+                    priv = entry.get("privilege") or entry.get("1")
+                else:
+                    priv = getattr(entry, "privilege", None)
 
-            await matter_client.write_attribute(
+                if priv is not None:
+                    # This entry is from our fabric, get its fabricIndex
+                    if isinstance(entry, dict):
+                        our_fabric_index = entry.get("fabricIndex") or entry.get("254")
+                    else:
+                        our_fabric_index = getattr(entry, "fabricIndex", None)
+                    break
+
+            LOGGER.debug("Our fabric index: %s", our_fabric_index)
+
+            # Build list of entries to keep:
+            # - Skip the entry at acl_index
+            # - Only include entries from OUR fabric (have privilege field)
+            updated_list: list[dict[str, Any]] = []
+            for idx, entry in enumerate(acl_list):
+                # Check if this entry is from our fabric
+                if isinstance(entry, dict):
+                    priv = entry.get("privilege") or entry.get("1")
+                else:
+                    priv = getattr(entry, "privilege", None)
+
+                # Skip entries from other fabrics (they only have fabricIndex)
+                if priv is None:
+                    LOGGER.debug("Skipping entry %d - different fabric", idx)
+                    continue
+
+                # Skip the entry we want to delete
+                if idx == acl_index:
+                    LOGGER.debug("Skipping entry %d - deleting this one", idx)
+                    continue
+
+                converted = self._acl_entry_to_dict(entry)
+                LOGGER.debug("Keeping entry %d: %s", idx, converted)
+                updated_list.append(converted)
+
+            LOGGER.info(
+                "Writing %d ACL entries to node %d (was %d)",
+                len(updated_list),
+                node_id,
+                len(acl_list),
+            )
+
+            # Use the dedicated set_acl_entry command for reliable ACL writes
+            await matter_client.send_command(
+                "set_acl_entry",
                 node_id=node_id,
-                attribute_path=acl_path,
-                value=updated_list,
+                entry=updated_list,
             )
             LOGGER.info("Deleted ACL entry %d from node %d", acl_index, node_id)
 
-        except (HomeAssistantError, OSError, ValueError) as err:
+        except Exception as err:  # noqa: BLE001
             LOGGER.error("Failed to delete ACL entry: %s", err)
             return False
         else:
             return True
+
+    def _binding_entry_to_dict(self, binding_entry: Any) -> dict[str, Any]:
+        """Convert a binding entry (SDK object or dict) to dict format for writing.
+
+        The Matter SDK expects binding entries in dict format with specific keys:
+        - node: int (target node ID for unicast binding)
+        - group: int (target group ID for group binding)
+        - endpoint: int (target endpoint)
+        - cluster: int (target cluster)
+        - fabricIndex: int (0 = device sets automatically)
+        """
+        if isinstance(binding_entry, dict):
+            # Already a dict, normalize keys
+            # SDK uses both numeric keys and lowercase keys
+            node = binding_entry.get("node") or binding_entry.get("1")
+            group = binding_entry.get("group") or binding_entry.get("2")
+            endpoint_val = binding_entry.get("endpoint") or binding_entry.get("3")
+            cluster = binding_entry.get("cluster") or binding_entry.get("4")
+        else:
+            # SDK cluster object
+            node = getattr(binding_entry, "node", None)
+            group = getattr(binding_entry, "group", None)
+            endpoint_val = getattr(binding_entry, "endpoint", None)
+            cluster = getattr(binding_entry, "cluster", None)
+
+        result: dict[str, Any] = {
+            "fabricIndex": 0,  # Device sets this automatically
+        }
+        if node is not None:
+            result["node"] = int(node)
+        if group is not None:
+            result["group"] = int(group)
+        if endpoint_val is not None:
+            result["endpoint"] = int(endpoint_val)
+        if cluster is not None:
+            result["cluster"] = int(cluster)
+
+        return result
 
     async def delete_binding_entry(
         self, node_id: int, endpoint: int, binding_index: int
@@ -2261,15 +2390,18 @@ class MatterBindingManager:
                 )
                 return False
 
-            # Remove the entry at the specified index
-            updated_list = (
-                binding_list[:binding_index] + binding_list[binding_index + 1 :]
-            )
+            # Convert all entries to dict format, excluding the one to delete
+            updated_list: list[dict[str, Any]] = []
+            for idx, entry in enumerate(binding_list):
+                if idx != binding_index:
+                    updated_list.append(self._binding_entry_to_dict(entry))
 
-            await matter_client.write_attribute(
+            # Use the dedicated set_node_binding command for reliable binding writes
+            await matter_client.send_command(
+                "set_node_binding",
                 node_id=node_id,
-                attribute_path=binding_path,
-                value=updated_list,
+                endpoint=endpoint,
+                bindings=updated_list,
             )
             LOGGER.info(
                 "Deleted binding entry %d from node %d endpoint %d",
@@ -2278,7 +2410,7 @@ class MatterBindingManager:
                 endpoint,
             )
 
-        except (HomeAssistantError, OSError, ValueError) as err:
+        except Exception as err:  # noqa: BLE001
             LOGGER.error("Failed to delete binding entry: %s", err)
             return False
         else:

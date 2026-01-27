@@ -548,8 +548,17 @@ async def ws_delete_acl_entry(
         )
         connection.send_result(msg["id"], {"success": success})
     except Exception as err:  # noqa: BLE001
-        LOGGER.exception("Error deleting ACL entry")
-        connection.send_error(msg["id"], "error", str(err))
+        # Check for NodeNotReady error (device offline)
+        if "not" in str(err).lower() and "available" in str(err).lower():
+            LOGGER.warning(
+                "Node %d is offline, cannot delete ACL entry", msg["node_id"]
+            )
+            connection.send_error(
+                msg["id"], "node_offline", f"Node {msg['node_id']} is offline"
+            )
+        else:
+            LOGGER.exception("Error deleting ACL entry")
+            connection.send_error(msg["id"], "error", str(err))
 
 
 # =============================================================================
@@ -599,8 +608,17 @@ async def ws_delete_binding_entry(
         )
         connection.send_result(msg["id"], {"success": success})
     except Exception as err:  # noqa: BLE001
-        LOGGER.exception("Error deleting binding entry")
-        connection.send_error(msg["id"], "error", str(err))
+        # Check for NodeNotReady error (device offline)
+        if "not" in str(err).lower() and "available" in str(err).lower():
+            LOGGER.warning(
+                "Node %d is offline, cannot delete binding entry", msg["node_id"]
+            )
+            connection.send_error(
+                msg["id"], "node_offline", f"Node {msg['node_id']} is offline"
+            )
+        else:
+            LOGGER.exception("Error deleting binding entry")
+            connection.send_error(msg["id"], "error", str(err))
 
 
 # =============================================================================
@@ -650,8 +668,17 @@ async def ws_delete_group_entry(
         )
         connection.send_result(msg["id"], {"success": success})
     except Exception as err:  # noqa: BLE001
-        LOGGER.exception("Error deleting group entry")
-        connection.send_error(msg["id"], "error", str(err))
+        # Check for NodeNotReady error (device offline)
+        if "not" in str(err).lower() and "available" in str(err).lower():
+            LOGGER.warning(
+                "Node %d is offline, cannot delete group entry", msg["node_id"]
+            )
+            connection.send_error(
+                msg["id"], "node_offline", f"Node {msg['node_id']} is offline"
+            )
+        else:
+            LOGGER.exception("Error deleting group entry")
+            connection.send_error(msg["id"], "error", str(err))
 
 
 # =============================================================================
@@ -700,8 +727,17 @@ async def ws_delete_group_key_map_entry(
         )
         connection.send_result(msg["id"], {"success": success})
     except Exception as err:  # noqa: BLE001
-        LOGGER.exception("Error deleting GroupKeyMap entry")
-        connection.send_error(msg["id"], "error", str(err))
+        # Check for NodeNotReady error (device offline)
+        if "not" in str(err).lower() and "available" in str(err).lower():
+            LOGGER.warning(
+                "Node %d is offline, cannot delete GroupKeyMap entry", msg["node_id"]
+            )
+            connection.send_error(
+                msg["id"], "node_offline", f"Node {msg['node_id']} is offline"
+            )
+        else:
+            LOGGER.exception("Error deleting GroupKeyMap entry")
+            connection.send_error(msg["id"], "error", str(err))
 
 
 # =============================================================================
@@ -751,5 +787,14 @@ async def ws_delete_group_key_set(
         )
         connection.send_result(msg["id"], {"success": success})
     except Exception as err:  # noqa: BLE001
-        LOGGER.exception("Error deleting GroupKeySet")
-        connection.send_error(msg["id"], "error", str(err))
+        # Check for NodeNotReady error (device offline)
+        if "not" in str(err).lower() and "available" in str(err).lower():
+            LOGGER.warning(
+                "Node %d is offline, cannot delete GroupKeySet", msg["node_id"]
+            )
+            connection.send_error(
+                msg["id"], "node_offline", f"Node {msg['node_id']} is offline"
+            )
+        else:
+            LOGGER.exception("Error deleting GroupKeySet")
+            connection.send_error(msg["id"], "error", str(err))
