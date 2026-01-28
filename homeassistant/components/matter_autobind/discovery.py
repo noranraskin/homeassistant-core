@@ -10,23 +10,40 @@ from matter_server.client.models import device_types
 
 from homeassistant.const import Platform
 
-from .const import CLUSTER_ID_LEVEL_CONTROL, CLUSTER_ID_ON_OFF, LOGGER
+from .climate import ClientClimateEntityDescription, ClientClusterClimate
+from .const import (
+    CLUSTER_ID_DOOR_LOCK,
+    CLUSTER_ID_FAN_CONTROL,
+    CLUSTER_ID_LEVEL_CONTROL,
+    CLUSTER_ID_ON_OFF,
+    CLUSTER_ID_THERMOSTAT,
+    CLUSTER_ID_WINDOW_COVERING,
+    LOGGER,
+)
+from .cover import ClientClusterCover, ClientCoverEntityDescription
+from .fan import ClientClusterFan, ClientFanEntityDescription
+from .light import ClientClusterLight, ClientLightEntityDescription
+from .lock import ClientClusterLock, ClientLockEntityDescription
 from .models import ClientClusterDiscoverySchema, ClientClusterEntityInfo
+from .switch import ClientClusterSwitch, ClientSwitchEntityDescription
 
 if TYPE_CHECKING:
     from matter_server.client.models.node import MatterEndpoint
 
     from homeassistant.helpers import entity_registry as er
 
-from .light import ClientClusterLight, ClientLightEntityDescription
-from .switch import ClientClusterSwitch, ClientSwitchEntityDescription
 
 # Client device types - devices that send commands rather than receive them
 # These have the Binding cluster and client-side clusters
 CLIENT_DEVICE_TYPES: tuple[type, ...] = (
+    # Light switches
     device_types.OnOffLightSwitch,
     device_types.DimmerSwitch,
     device_types.ColorDimmerSwitch,
+    # Lock controller
+    device_types.DoorLockController,
+    # Window covering controller
+    device_types.WindowCoveringController,
 )
 
 
@@ -58,6 +75,54 @@ def _get_discovery_schemas() -> list[ClientClusterDiscoverySchema]:
             entity_class=ClientClusterLight,
             required_client_clusters=(CLUSTER_ID_ON_OFF, CLUSTER_ID_LEVEL_CONTROL),
             device_type=(device_types.DimmerSwitch, device_types.ColorDimmerSwitch),
+        ),
+        # Door Lock Controller -> Lock entity
+        ClientClusterDiscoverySchema(
+            platform=Platform.LOCK,
+            entity_description=ClientLockEntityDescription(
+                key="client_doorlock",
+                name=None,  # Use device name
+            ),
+            entity_class=ClientClusterLock,
+            required_client_clusters=(CLUSTER_ID_DOOR_LOCK,),
+            device_type=(device_types.DoorLockController,),
+        ),
+        # Window Covering Controller -> Cover entity
+        ClientClusterDiscoverySchema(
+            platform=Platform.COVER,
+            entity_description=ClientCoverEntityDescription(
+                key="client_windowcovering",
+                name=None,  # Use device name
+            ),
+            entity_class=ClientClusterCover,
+            required_client_clusters=(CLUSTER_ID_WINDOW_COVERING,),
+            device_type=(device_types.WindowCoveringController,),
+        ),
+        # Thermostat (if device has thermostat client cluster) -> Climate entity
+        # Note: No standard "ThermostatController" device type exists in Matter
+        # This schema matches devices with thermostat client clusters
+        ClientClusterDiscoverySchema(
+            platform=Platform.CLIMATE,
+            entity_description=ClientClimateEntityDescription(
+                key="client_thermostat",
+                name=None,  # Use device name
+            ),
+            entity_class=ClientClusterClimate,
+            required_client_clusters=(CLUSTER_ID_THERMOSTAT,),
+            device_type=None,  # Match any device with thermostat client cluster
+        ),
+        # Fan Control (if device has fan client cluster) -> Fan entity
+        # Note: No standard "FanController" device type exists in Matter
+        # This schema matches devices with fan control client clusters
+        ClientClusterDiscoverySchema(
+            platform=Platform.FAN,
+            entity_description=ClientFanEntityDescription(
+                key="client_fancontrol",
+                name=None,  # Use device name
+            ),
+            entity_class=ClientClusterFan,
+            required_client_clusters=(CLUSTER_ID_FAN_CONTROL,),
+            device_type=None,  # Match any device with fan control client cluster
         ),
     ]
 
@@ -101,6 +166,41 @@ def endpoint_has_server_and_client_clusters(
     return False
 
 
+def _check_entity_matches_endpoint(
+    entity: er.RegistryEntry,
+    node_id: int,
+    endpoint_id: int,
+) -> bool:
+    """Check if an entity from matter integration matches the given endpoint.
+
+    Returns True if the entity is for the specified node/endpoint and is a switch/light.
+    """
+    if entity.platform != "matter":
+        return False
+
+    # Matter entities have unique_id format:
+    # {fabric_id}-{node_id}-{endpoint_id}-{key}-{cluster_id}-{attribute_id}
+    unique_id = entity.unique_id
+    if not unique_id or f"-{node_id}-" not in unique_id:
+        return False
+
+    # The endpoint_id is the third part after splitting by "-"
+    parts = unique_id.split("-")
+    if len(parts) < 3:
+        return False
+
+    try:
+        entity_endpoint_id = int(parts[2])
+    except (ValueError, IndexError):
+        return False
+
+    if entity_endpoint_id != endpoint_id:
+        return False
+
+    # Check if it's a switch or light
+    return entity.domain in ("switch", "light")
+
+
 def endpoint_has_existing_entity(
     endpoint: MatterEndpoint,
     entity_registry: er.EntityRegistry,
@@ -110,40 +210,19 @@ def endpoint_has_existing_entity(
     Returns True if the endpoint already has a switch or light entity,
     meaning we don't need to create a client cluster entity for it.
     """
-    # Look for existing entities for this device
-    # The matter integration uses a specific unique_id format
     node_id = endpoint.node.node_id
     endpoint_id = endpoint.endpoint_id
 
-    # Check all entities in registry for matter platform
     for entity in entity_registry.entities.values():
-        if entity.platform != "matter":
-            continue
-
-        # Matter entities have unique_id format:
-        # {fabric_id}-{node_id}-{endpoint_id}-{key}-{cluster_id}-{attribute_id}
-        # We check if the unique_id contains our node and endpoint
-        unique_id = entity.unique_id
-        if unique_id and f"-{node_id}-" in unique_id:
-            # Check if it's for our endpoint
-            # The endpoint_id is the third part after splitting by "-"
-            parts = unique_id.split("-")
-            if len(parts) >= 3:
-                try:
-                    entity_endpoint_id = int(parts[2])
-                    if entity_endpoint_id == endpoint_id:
-                        # Check if it's a switch or light
-                        if entity.domain in ("switch", "light"):
-                            LOGGER.debug(
-                                "Endpoint %d/%d already has %s entity: %s",
-                                node_id,
-                                endpoint_id,
-                                entity.domain,
-                                entity.entity_id,
-                            )
-                            return True
-                except (ValueError, IndexError):
-                    continue
+        if _check_entity_matches_endpoint(entity, node_id, endpoint_id):
+            LOGGER.debug(
+                "Endpoint %d/%d already has %s entity: %s",
+                node_id,
+                endpoint_id,
+                entity.domain,
+                entity.entity_id,
+            )
+            return True
 
     return False
 
@@ -179,20 +258,32 @@ def async_discover_client_cluster_entities(
         )
         return
 
-    # Check if this endpoint has any client device types
+    # Get endpoint's device types and client clusters for matching
     endpoint_device_types = set(endpoint.device_types)
 
+    # Get client cluster list from descriptor
+    descriptor = endpoint.get_cluster(Clusters.Descriptor)
+    client_cluster_ids = set(descriptor.clientList or []) if descriptor else set()
+
     for schema in _get_discovery_schemas():
-        # Check device type match
+        # Check device type match (if required)
         if schema.device_type is not None:
             if not any(dt in schema.device_type for dt in endpoint_device_types):
                 continue
+        # No device type specified - check client clusters instead
+        # All required client clusters must be present
+        elif not all(
+            cluster_id in client_cluster_ids
+            for cluster_id in schema.required_client_clusters
+        ):
+            continue
 
         LOGGER.debug(
-            "Matched schema %s for endpoint %d (device types: %s)",
+            "Matched schema %s for endpoint %d (device types: %s, client clusters: %s)",
             schema.entity_description.key,
             endpoint.endpoint_id,
             [dt.__name__ for dt in endpoint_device_types],
+            [f"0x{c:04X}" for c in client_cluster_ids],
         )
 
         yield ClientClusterEntityInfo(

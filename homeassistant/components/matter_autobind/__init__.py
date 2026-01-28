@@ -32,7 +32,14 @@ if TYPE_CHECKING:
     from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
 # Platforms to set up
-PLATFORMS = [Platform.LIGHT, Platform.SWITCH]
+PLATFORMS = [
+    Platform.CLIMATE,
+    Platform.COVER,
+    Platform.FAN,
+    Platform.LIGHT,
+    Platform.LOCK,
+    Platform.SWITCH,
+]
 
 
 @dataclass
@@ -43,7 +50,11 @@ class MatterAutoBindData:
     store: MatterBindingStore
 
     # Platform entity callbacks (set during platform setup)
+    climate_add_entities: AddConfigEntryEntitiesCallback | None = None
+    cover_add_entities: AddConfigEntryEntitiesCallback | None = None
+    fan_add_entities: AddConfigEntryEntitiesCallback | None = None
     light_add_entities: AddConfigEntryEntitiesCallback | None = None
+    lock_add_entities: AddConfigEntryEntitiesCallback | None = None
     switch_add_entities: AddConfigEntryEntitiesCallback | None = None
 
 

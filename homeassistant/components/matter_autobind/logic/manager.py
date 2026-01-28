@@ -945,8 +945,12 @@ class MatterBindingManager:
         runtime_data = self._config_entry.runtime_data
 
         # Collect entities to add by platform
-        switch_entities: list = []
+        climate_entities: list = []
+        cover_entities: list = []
+        fan_entities: list = []
         light_entities: list = []
+        lock_entities: list = []
+        switch_entities: list = []
 
         # Get all nodes from the matter client
         for node in matter.matter_client.get_nodes():
@@ -979,25 +983,55 @@ class MatterBindingManager:
                         entity_info,
                     )
 
-                    # Add to appropriate list
-                    if entity_info.platform.value == "switch":
-                        switch_entities.append(entity)
-                    elif entity_info.platform.value == "light":
-                        light_entities.append(entity)
+                    # Add to appropriate list based on platform
+                    match entity_info.platform.value:
+                        case "climate":
+                            climate_entities.append(entity)
+                        case "cover":
+                            cover_entities.append(entity)
+                        case "fan":
+                            fan_entities.append(entity)
+                        case "light":
+                            light_entities.append(entity)
+                        case "lock":
+                            lock_entities.append(entity)
+                        case "switch":
+                            switch_entities.append(entity)
 
         # Add entities via platform callbacks
-        if switch_entities and runtime_data.switch_add_entities:
-            LOGGER.info("Adding %d switch entities", len(switch_entities))
-            runtime_data.switch_add_entities(switch_entities)
+        if climate_entities and runtime_data.climate_add_entities:
+            LOGGER.info("Adding %d climate entities", len(climate_entities))
+            runtime_data.climate_add_entities(climate_entities)
+
+        if cover_entities and runtime_data.cover_add_entities:
+            LOGGER.info("Adding %d cover entities", len(cover_entities))
+            runtime_data.cover_add_entities(cover_entities)
+
+        if fan_entities and runtime_data.fan_add_entities:
+            LOGGER.info("Adding %d fan entities", len(fan_entities))
+            runtime_data.fan_add_entities(fan_entities)
 
         if light_entities and runtime_data.light_add_entities:
             LOGGER.info("Adding %d light entities", len(light_entities))
             runtime_data.light_add_entities(light_entities)
 
+        if lock_entities and runtime_data.lock_add_entities:
+            LOGGER.info("Adding %d lock entities", len(lock_entities))
+            runtime_data.lock_add_entities(lock_entities)
+
+        if switch_entities and runtime_data.switch_add_entities:
+            LOGGER.info("Adding %d switch entities", len(switch_entities))
+            runtime_data.switch_add_entities(switch_entities)
+
         LOGGER.info(
-            "Client cluster discovery complete: %d switch, %d light entities",
-            len(switch_entities),
+            "Client cluster discovery complete: "
+            "%d climate, %d cover, %d fan, %d light, %d lock, %d switch entities",
+            len(climate_entities),
+            len(cover_entities),
+            len(fan_entities),
             len(light_entities),
+            len(lock_entities),
+            len(switch_entities),
         )
 
     async def _async_discover_client_clusters_for_node(self, node) -> None:
@@ -1025,8 +1059,12 @@ class MatterBindingManager:
         runtime_data = self._config_entry.runtime_data
 
         # Collect entities to add by platform
-        switch_entities: list = []
+        climate_entities: list = []
+        cover_entities: list = []
+        fan_entities: list = []
         light_entities: list = []
+        lock_entities: list = []
+        switch_entities: list = []
 
         LOGGER.debug(
             "Checking node %d for client clusters (endpoints: %s)",
@@ -1057,20 +1095,45 @@ class MatterBindingManager:
                     entity_info,
                 )
 
-                # Add to appropriate list
-                if entity_info.platform.value == "switch":
-                    switch_entities.append(entity)
-                elif entity_info.platform.value == "light":
-                    light_entities.append(entity)
+                # Add to appropriate list based on platform
+                match entity_info.platform.value:
+                    case "climate":
+                        climate_entities.append(entity)
+                    case "cover":
+                        cover_entities.append(entity)
+                    case "fan":
+                        fan_entities.append(entity)
+                    case "light":
+                        light_entities.append(entity)
+                    case "lock":
+                        lock_entities.append(entity)
+                    case "switch":
+                        switch_entities.append(entity)
 
         # Add entities via platform callbacks
-        if switch_entities and runtime_data.switch_add_entities:
+        if climate_entities and runtime_data.climate_add_entities:
             LOGGER.info(
-                "Adding %d switch entities for node %d",
-                len(switch_entities),
+                "Adding %d climate entities for node %d",
+                len(climate_entities),
                 node.node_id,
             )
-            runtime_data.switch_add_entities(switch_entities)
+            runtime_data.climate_add_entities(climate_entities)
+
+        if cover_entities and runtime_data.cover_add_entities:
+            LOGGER.info(
+                "Adding %d cover entities for node %d",
+                len(cover_entities),
+                node.node_id,
+            )
+            runtime_data.cover_add_entities(cover_entities)
+
+        if fan_entities and runtime_data.fan_add_entities:
+            LOGGER.info(
+                "Adding %d fan entities for node %d",
+                len(fan_entities),
+                node.node_id,
+            )
+            runtime_data.fan_add_entities(fan_entities)
 
         if light_entities and runtime_data.light_add_entities:
             LOGGER.info(
@@ -1080,11 +1143,32 @@ class MatterBindingManager:
             )
             runtime_data.light_add_entities(light_entities)
 
+        if lock_entities and runtime_data.lock_add_entities:
+            LOGGER.info(
+                "Adding %d lock entities for node %d",
+                len(lock_entities),
+                node.node_id,
+            )
+            runtime_data.lock_add_entities(lock_entities)
+
+        if switch_entities and runtime_data.switch_add_entities:
+            LOGGER.info(
+                "Adding %d switch entities for node %d",
+                len(switch_entities),
+                node.node_id,
+            )
+            runtime_data.switch_add_entities(switch_entities)
+
         LOGGER.info(
-            "Client cluster discovery for node %d complete: %d switch, %d light entities",
+            "Client cluster discovery for node %d complete: "
+            "%d climate, %d cover, %d fan, %d light, %d lock, %d switch entities",
             node.node_id,
-            len(switch_entities),
+            len(climate_entities),
+            len(cover_entities),
+            len(fan_entities),
             len(light_entities),
+            len(lock_entities),
+            len(switch_entities),
         )
 
     # =========================================================================

@@ -133,6 +133,43 @@ class AutomationAnalyzer:
 
         return self._hass.data[DATA_COMPONENT].get_entity(automation_id)
 
+    def _process_state_trigger(
+        self,
+        trigger_conf: dict[str, Any],
+        platform: str,
+        triggers: list[TriggerInfo],
+        trigger_entity_ids: list[str],
+    ) -> None:
+        """Process a state or numeric_state trigger configuration."""
+        entity_ids = trigger_conf.get(CONF_ENTITY_ID, [])
+        if isinstance(entity_ids, str):
+            entity_ids = [entity_ids]
+        triggers.extend(self._build_trigger_info(eid, platform) for eid in entity_ids)
+        trigger_entity_ids.extend(entity_ids)
+
+    def _process_device_trigger(
+        self,
+        trigger_conf: dict[str, Any],
+        platform: str,
+        triggers: list[TriggerInfo],
+        trigger_device_ids: list[str],
+    ) -> None:
+        """Process a device trigger configuration."""
+        device_id = trigger_conf.get(CONF_DEVICE_ID)
+        if device_id:
+            if isinstance(device_id, list):
+                trigger_device_ids.extend(device_id)
+            else:
+                trigger_device_ids.append(device_id)
+
+        # Also check for entity_id in device triggers
+        entity_id = trigger_conf.get(CONF_ENTITY_ID)
+        if entity_id:
+            entity_list = entity_id if isinstance(entity_id, list) else [entity_id]
+            triggers.extend(
+                self._build_trigger_info(eid, platform) for eid in entity_list
+            )
+
     async def _extract_triggers(
         self, automation_id: str, automation_entity: Any
     ) -> list[TriggerInfo]:
@@ -161,36 +198,13 @@ class AutomationAnalyzer:
                     platform = trigger_conf.get(CONF_PLATFORM, "unknown")
 
                     if platform in ("state", "numeric_state"):
-                        entity_ids = trigger_conf.get(CONF_ENTITY_ID, [])
-                        if isinstance(entity_ids, str):
-                            entity_ids = [entity_ids]
-                        # Build trigger info for each entity
-                        triggers.extend(
-                            self._build_trigger_info(eid, platform)
-                            for eid in entity_ids
+                        self._process_state_trigger(
+                            trigger_conf, platform, triggers, trigger_entity_ids
                         )
-                        trigger_entity_ids.extend(entity_ids)
-
                     elif platform == "device":
-                        device_id = trigger_conf.get(CONF_DEVICE_ID)
-                        if device_id:
-                            if isinstance(device_id, list):
-                                trigger_device_ids.extend(device_id)
-                            else:
-                                trigger_device_ids.append(device_id)
-
-                        # Also check for entity_id in device triggers
-                        entity_id = trigger_conf.get(CONF_ENTITY_ID)
-                        if entity_id:
-                            entity_list = (
-                                entity_id
-                                if isinstance(entity_id, list)
-                                else [entity_id]
-                            )
-                            triggers.extend(
-                                self._build_trigger_info(eid, platform)
-                                for eid in entity_list
-                            )
+                        self._process_device_trigger(
+                            trigger_conf, platform, triggers, trigger_device_ids
+                        )
 
         except (AttributeError, TypeError):
             self._logger.debug(
@@ -259,6 +273,40 @@ class AutomationAnalyzer:
 
         return actions
 
+    def _extract_matter_ids_from_entity(
+        self, entity_id: str
+    ) -> tuple[int | None, int | None]:
+        """Extract node_id and endpoint_id from a Matter entity.
+
+        Args:
+            entity_id: The entity_id to look up.
+
+        Returns:
+            Tuple of (node_id, endpoint_id), both None if not a Matter entity
+            or if parsing fails.
+        """
+        entity_entry = self._entity_registry.async_get(entity_id)
+        if entity_entry is None or entity_entry.platform != "matter":
+            return None, None
+
+        # Matter entities have unique_id format:
+        # {fabric_id}-{node_id}-{endpoint_id}-{key}-{cluster_id}-{attribute_id}
+        unique_id = entity_entry.unique_id
+        if not unique_id:
+            return None, None
+
+        parts = unique_id.split("-")
+        if len(parts) < 3:
+            return None, None
+
+        try:
+            node_id = int(parts[1])
+            endpoint_id = int(parts[2])
+        except (ValueError, IndexError):
+            return None, None
+
+        return node_id, endpoint_id
+
     def _build_trigger_info(self, entity_id: str, trigger_type: str) -> TriggerInfo:
         """Build a TriggerInfo object for an entity.
 
@@ -270,11 +318,7 @@ class AutomationAnalyzer:
             TriggerInfo with Matter information filled in.
         """
         is_matter = is_matter_entity(entity_id, self._entity_registry)
-        node_id = None
-        endpoint_id = None
-
-        # TODO: Extract node_id and endpoint_id from entity registry
-        # This requires looking up the device and parsing the unique_id
+        node_id, endpoint_id = self._extract_matter_ids_from_entity(entity_id)
 
         return TriggerInfo(
             entity_id=entity_id,
@@ -295,8 +339,7 @@ class AutomationAnalyzer:
             ActionInfo with Matter information filled in.
         """
         is_matter = is_matter_entity(entity_id, self._entity_registry)
-        node_id = None
-        endpoint_id = None
+        node_id, endpoint_id = self._extract_matter_ids_from_entity(entity_id)
 
         return ActionInfo(
             entity_id=entity_id,
