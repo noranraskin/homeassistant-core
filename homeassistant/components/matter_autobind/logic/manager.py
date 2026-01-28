@@ -31,7 +31,12 @@ from ..automation import (
 )
 from ..const import (
     CLUSTER_ID_BINDING,
+    CLUSTER_ID_DOOR_LOCK,
+    CLUSTER_ID_FAN_CONTROL,
+    CLUSTER_ID_LEVEL_CONTROL,
     CLUSTER_ID_ON_OFF,
+    CLUSTER_ID_THERMOSTAT,
+    CLUSTER_ID_WINDOW_COVERING,
     DEBUG_OVERWRITE_ACLS,
     DOMAIN,
     LOGGER,
@@ -872,10 +877,26 @@ class MatterBindingManager:
             )
             return False
 
+        # Client device types - devices that send commands rather than receive them
         client_device_types = (
+            # Light switches
             device_types.OnOffLightSwitch,
             device_types.DimmerSwitch,
             device_types.ColorDimmerSwitch,
+            # Lock controller
+            device_types.DoorLockController,
+            # Window covering controller
+            device_types.WindowCoveringController,
+        )
+
+        # Client clusters that indicate binding capability
+        client_cluster_ids = (
+            CLUSTER_ID_ON_OFF,
+            CLUSTER_ID_LEVEL_CONTROL,
+            CLUSTER_ID_DOOR_LOCK,
+            CLUSTER_ID_WINDOW_COVERING,
+            CLUSTER_ID_THERMOSTAT,
+            CLUSTER_ID_FAN_CONTROL,
         )
 
         for endpoint in node.endpoints.values():
@@ -890,21 +911,25 @@ class MatterBindingManager:
                     )
                     return True
 
-            # Check 2: Stateful switches - have BOTH server and client clusters
-            # These are devices like DimmableLightSwitch that have OnOff server
-            # (for local state) AND OnOff client (for controlling other devices)
+            # Check 2: Devices with client clusters and binding capability
+            # These are devices that have client clusters (for controlling other devices)
+            # and the binding cluster for actual binding capability
             descriptor = endpoint.get_cluster(Clusters.Descriptor)
             if descriptor is not None:
                 client_list = set(descriptor.clientList or [])
-                # Check if endpoint has OnOff or LevelControl in client list
-                if CLUSTER_ID_ON_OFF in client_list:
+                # Check if endpoint has any supported client cluster
+                if any(cluster_id in client_list for cluster_id in client_cluster_ids):
                     # Also verify it has the binding cluster for actual binding capability
                     if endpoint.has_cluster(CLUSTER_ID_BINDING):
                         LOGGER.debug(
-                            "Node %d endpoint %d is a stateful switch "
-                            "(has OnOff client cluster + binding cluster)",
+                            "Node %d endpoint %d has client cluster(s) %s + binding cluster",
                             node.node_id,
                             endpoint.endpoint_id,
+                            [
+                                f"0x{c:04X}"
+                                for c in client_list
+                                if c in client_cluster_ids
+                            ],
                         )
                         return True
 
@@ -918,8 +943,9 @@ class MatterBindingManager:
         """Discover Matter nodes with client clusters and create entities.
 
         This scans all Matter nodes for endpoints that have client cluster
-        device types (like OnOffLightSwitch, DimmerSwitch) but don't already
-        have entities from the official matter integration.
+        device types (like OnOffLightSwitch, DimmerSwitch, DoorLockController,
+        WindowCoveringController) but don't already have entities from the
+        official matter integration.
         """
         LOGGER.info("Starting client cluster discovery")
 

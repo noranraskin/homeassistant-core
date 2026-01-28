@@ -46,6 +46,11 @@ CLIENT_DEVICE_TYPES: tuple[type, ...] = (
     device_types.WindowCoveringController,
 )
 
+# Entity domains supported by this integration for client cluster entities
+SUPPORTED_ENTITY_DOMAINS: frozenset[str] = frozenset(
+    {"climate", "cover", "fan", "light", "lock", "switch"}
+)
+
 
 def _get_discovery_schemas() -> list[ClientClusterDiscoverySchema]:
     """Return discovery schemas for client cluster entities.
@@ -173,7 +178,8 @@ def _check_entity_matches_endpoint(
 ) -> bool:
     """Check if an entity from matter integration matches the given endpoint.
 
-    Returns True if the entity is for the specified node/endpoint and is a switch/light.
+    Returns True if the entity is for the specified node/endpoint and is a
+    supported entity domain (climate, cover, fan, light, lock, switch).
     """
     if entity.platform != "matter":
         return False
@@ -197,8 +203,8 @@ def _check_entity_matches_endpoint(
     if entity_endpoint_id != endpoint_id:
         return False
 
-    # Check if it's a switch or light
-    return entity.domain in ("switch", "light")
+    # Check if it's a supported entity domain
+    return entity.domain in SUPPORTED_ENTITY_DOMAINS
 
 
 def endpoint_has_existing_entity(
@@ -207,8 +213,9 @@ def endpoint_has_existing_entity(
 ) -> bool:
     """Check if an endpoint already has a suitable entity from the matter integration.
 
-    Returns True if the endpoint already has a switch or light entity,
-    meaning we don't need to create a client cluster entity for it.
+    Returns True if the endpoint already has a supported entity
+    (climate, cover, fan, light, lock, switch), meaning we don't need to
+    create a client cluster entity for it.
     """
     node_id = endpoint.node.node_id
     endpoint_id = endpoint.endpoint_id
