@@ -427,7 +427,13 @@ class MatterAdapter:
         def filter_acl(acl_list: list[Any]) -> list[Any]:
             """Filter out entries matching subject AND auth_mode."""
             result = []
-            for acl_entry in acl_list:
+            self._logger.debug(
+                "Filtering ACLs on node %d: looking for subject=%d, auth_mode=%d",
+                target_node_id,
+                subject,
+                auth_mode,
+            )
+            for i, acl_entry in enumerate(acl_list):
                 if isinstance(acl_entry, dict):
                     subjects = acl_entry.get("3", []) or []
                     entry_auth_mode = acl_entry.get("2", 0)
@@ -435,24 +441,36 @@ class MatterAdapter:
                     subjects = getattr(acl_entry, "subjects", []) or []
                     entry_auth_mode = getattr(acl_entry, "authMode", 0)
 
-                if subject not in subjects or entry_auth_mode != auth_mode:
+                should_remove = subject in subjects and entry_auth_mode == auth_mode
+                self._logger.debug(
+                    "  ACL[%d]: subjects=%s, authMode=%d -> %s",
+                    i,
+                    subjects,
+                    entry_auth_mode,
+                    "REMOVE" if should_remove else "KEEP",
+                )
+                if not should_remove:
                     result.append(acl_entry)
+            self._logger.debug(
+                "Filter result: %d ACLs in, %d ACLs out", len(acl_list), len(result)
+            )
             return result
 
         try:
-            success, _ = await self._read_modify_write(
+            success, final_list = await self._read_modify_write(
                 node_id=target_node_id,
                 attribute_path="0/31/0",
                 modify_fn=filter_acl,
-                verify=False,  # Remove doesn't need strict verification
+                verify=True,  # Verify removal succeeded
                 operation_name=f"{auth_mode_name} ACL remove",
             )
             if success:
                 self._logger.info(
-                    "Removed %s ACL from node %d for subject %d",
+                    "Removed %s ACL from node %d for subject %d (now %d ACLs)",
                     auth_mode_name,
                     target_node_id,
                     subject,
+                    len(final_list),
                 )
 
         except (HomeAssistantError, OSError, ValueError) as err:
@@ -734,15 +752,45 @@ class MatterAdapter:
         def filter_binding(binding_list: list[Any]) -> list[Any]:
             """Filter out entries matching target."""
             result = []
-            for binding in binding_list:
+            self._logger.debug(
+                "Filtering bindings on node %d: looking for target=%s (value=%d, is_group=%s)",
+                source_node_id,
+                target,
+                target_value,
+                is_group,
+            )
+            for i, binding in enumerate(binding_list):
+                should_remove = False
                 if isinstance(binding, dict):
                     if is_group:
-                        if binding.get("2") != target_value:
-                            result.append(binding)
-                    elif binding.get("1") != target_value:
-                        result.append(binding)
+                        binding_group = binding.get("2")
+                        should_remove = binding_group == target_value
+                        self._logger.debug(
+                            "  Binding[%d]: group=%s -> %s",
+                            i,
+                            binding_group,
+                            "REMOVE" if should_remove else "KEEP",
+                        )
+                    else:
+                        binding_node = binding.get("1")
+                        should_remove = binding_node == target_value
+                        self._logger.debug(
+                            "  Binding[%d]: node=%s -> %s",
+                            i,
+                            binding_node,
+                            "REMOVE" if should_remove else "KEEP",
+                        )
                 else:
+                    self._logger.debug(
+                        "  Binding[%d]: non-dict type %s -> KEEP", i, type(binding)
+                    )
+                if not should_remove:
                     result.append(binding)
+            self._logger.debug(
+                "Filter result: %d bindings in, %d bindings out",
+                len(binding_list),
+                len(result),
+            )
             return result
 
         try:
@@ -751,16 +799,19 @@ class MatterAdapter:
             )
             binding_path = f"{binding_endpoint}/30/0"
 
-            success, _ = await self._read_modify_write(
+            success, final_list = await self._read_modify_write(
                 node_id=source_node_id,
                 attribute_path=binding_path,
                 modify_fn=filter_binding,
-                verify=False,
+                verify=True,  # Verify removal succeeded
                 operation_name="binding remove",
             )
             if success:
                 self._logger.info(
-                    "Removed binding from node %d to %s", source_node_id, target
+                    "Removed binding from node %d to %s (now %d bindings)",
+                    source_node_id,
+                    target,
+                    len(final_list),
                 )
 
         except (HomeAssistantError, OSError, ValueError) as err:

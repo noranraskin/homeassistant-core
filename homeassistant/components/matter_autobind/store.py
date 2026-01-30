@@ -644,15 +644,23 @@ class MatterBindingStore:
         is_new = False
 
         if key in self._data.acl_resources:
-            # Increment ref count
-            self._data.acl_resources[key]["ref_count"] += 1
+            # Only increment ref count if this automation hasn't already acquired it
             if automation_id not in self._data.acl_resources[key]["automation_ids"]:
+                self._data.acl_resources[key]["ref_count"] += 1
                 self._data.acl_resources[key]["automation_ids"].append(automation_id)
-            LOGGER.debug(
-                "ACL %s ref_count incremented to %d",
-                key,
-                self._data.acl_resources[key]["ref_count"],
-            )
+                LOGGER.debug(
+                    "ACL %s ref_count incremented to %d (new automation: %s)",
+                    key,
+                    self._data.acl_resources[key]["ref_count"],
+                    automation_id,
+                )
+            else:
+                LOGGER.debug(
+                    "ACL %s already acquired by %s, ref_count unchanged at %d",
+                    key,
+                    automation_id,
+                    self._data.acl_resources[key]["ref_count"],
+                )
         else:
             # Create new resource entry
             self._data.acl_resources[key] = AclResourceDict(
@@ -722,17 +730,25 @@ class MatterBindingStore:
         is_new = False
 
         if key in self._data.binding_resources:
-            # Increment ref count
-            self._data.binding_resources[key]["ref_count"] += 1
+            # Only increment ref count if this automation hasn't already acquired it
             if automation_id not in self._data.binding_resources[key]["automation_ids"]:
+                self._data.binding_resources[key]["ref_count"] += 1
                 self._data.binding_resources[key]["automation_ids"].append(
                     automation_id
                 )
-            LOGGER.debug(
-                "Binding %s ref_count incremented to %d",
-                key,
-                self._data.binding_resources[key]["ref_count"],
-            )
+                LOGGER.debug(
+                    "Binding %s ref_count incremented to %d (new automation: %s)",
+                    key,
+                    self._data.binding_resources[key]["ref_count"],
+                    automation_id,
+                )
+            else:
+                LOGGER.debug(
+                    "Binding %s already acquired by %s, ref_count unchanged at %d",
+                    key,
+                    automation_id,
+                    self._data.binding_resources[key]["ref_count"],
+                )
         else:
             # Parse target
             target_node_id, target_group_id = parse_binding_target(target)
@@ -808,15 +824,23 @@ class MatterBindingStore:
         is_new = False
 
         if key in self._data.group_resources:
-            # Increment ref count
-            self._data.group_resources[key]["ref_count"] += 1
+            # Only increment ref count if this automation hasn't already acquired it
             if automation_id not in self._data.group_resources[key]["automation_ids"]:
+                self._data.group_resources[key]["ref_count"] += 1
                 self._data.group_resources[key]["automation_ids"].append(automation_id)
-            LOGGER.debug(
-                "Group %s ref_count incremented to %d",
-                key,
-                self._data.group_resources[key]["ref_count"],
-            )
+                LOGGER.debug(
+                    "Group %s ref_count incremented to %d (new automation: %s)",
+                    key,
+                    self._data.group_resources[key]["ref_count"],
+                    automation_id,
+                )
+            else:
+                LOGGER.debug(
+                    "Group %s already acquired by %s, ref_count unchanged at %d",
+                    key,
+                    automation_id,
+                    self._data.group_resources[key]["ref_count"],
+                )
         else:
             # Create new resource entry with epoch key for future reuse
             self._data.group_resources[key] = GroupResourceDict(
