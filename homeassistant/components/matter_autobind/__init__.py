@@ -84,11 +84,11 @@ async def async_setup_entry(
     # Store in hass.data for platform access
     hass.data[DOMAIN][entry.entry_id] = runtime_data
 
-    # Set up the manager (loads store, scans automations, discovers client clusters)
-    await manager.async_setup()
-
-    # Forward platform setup (so callbacks are registered)
+    # Forward platform setup FIRST (so callbacks are registered)
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
+    # Set up the manager AFTER platforms (so entity callbacks are available)
+    await manager.async_setup()
 
     # Register WebSocket API commands
     async_register_websocket_commands(hass)

@@ -1048,6 +1048,11 @@ class MatterBindingManager:
         if switch_entities and runtime_data.switch_add_entities:
             LOGGER.info("Adding %d switch entities", len(switch_entities))
             runtime_data.switch_add_entities(switch_entities)
+        elif switch_entities:
+            LOGGER.warning(
+                "Found %d switch entities but switch_add_entities callback not set",
+                len(switch_entities),
+            )
 
         LOGGER.info(
             "Client cluster discovery complete: "

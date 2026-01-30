@@ -99,7 +99,7 @@ class GroupManager:
             self._logger.warning("Matter integration not available for group creation")
             return
 
-        group_name = f"AutoBind-{group_id}"
+        group_name = f"g{group_id}"
         key_set_index = (group_id % 16) + 1
 
         # Generate ONE shared key for all nodes
