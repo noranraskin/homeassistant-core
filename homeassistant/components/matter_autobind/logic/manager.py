@@ -260,6 +260,11 @@ class MatterBindingManager:
                 automation_id,
             )
 
+            # Wait a bit more to ensure the enable event is fully processed
+            # before we remove from _suppressing_automations. This prevents
+            # the event handler from triggering unnecessary reconciliation.
+            await asyncio.sleep(0.1)
+
         except Exception as err:  # noqa: BLE001
             LOGGER.error(
                 "Failed to suppress automation %s: %s",
@@ -435,6 +440,15 @@ class MatterBindingManager:
         old_state = event.data["old_state"]
         new_state = event.data["new_state"]
 
+        # Skip ALL processing if we're suppressing this automation
+        # This prevents unnecessary reconciliation during physical interaction handling
+        if entity_id in self._suppressing_automations:
+            LOGGER.debug(
+                "Automation %s is being suppressed by us, ignoring state change event",
+                entity_id,
+            )
+            return
+
         # Handle deletion - clean up ACLs and bindings
         if new_state is None:
             LOGGER.info(
@@ -459,14 +473,6 @@ class MatterBindingManager:
             and old_state.state == "on"
             and new_state.state == "off"
         ):
-            # Check if this is our own temporary suppression - skip binding removal
-            if entity_id in self._suppressing_automations:
-                LOGGER.debug(
-                    "Automation %s is being suppressed by us, skipping binding removal",
-                    entity_id,
-                )
-                return
-
             LOGGER.info(
                 "Automation %s was disabled, removing bindings (keeping ACLs)",
                 entity_id,
@@ -482,14 +488,6 @@ class MatterBindingManager:
             and old_state.state == "off"
             and new_state.state == "on"
         ):
-            # Check if this is our own re-enabling after suppression - skip binding recreation
-            if entity_id in self._suppressing_automations:
-                LOGGER.debug(
-                    "Automation %s is being re-enabled after suppression, skipping binding recreation",
-                    entity_id,
-                )
-                return
-
             LOGGER.info("Automation %s was enabled, recreating bindings", entity_id)
             self._hass.async_create_task(
                 self._async_handle_automation_enabled(entity_id)
@@ -504,6 +502,21 @@ class MatterBindingManager:
                 entity_id,
             )
             return
+
+        # Skip if only last_triggered changed - this happens when the automation
+        # runs, not when its configuration is modified
+        if old_state is not None:
+            old_attrs = dict(old_state.attributes)
+            new_attrs = dict(new_state.attributes)
+            # Remove last_triggered from comparison
+            old_attrs.pop("last_triggered", None)
+            new_attrs.pop("last_triggered", None)
+            if old_attrs == new_attrs:
+                # LOGGER.debug(
+                #     "Automation %s: only last_triggered changed (automation ran), skipping recheck",
+                #     entity_id,
+                # )
+                return
 
         LOGGER.info("=" * 60)
         LOGGER.info("MATTER AUTOBIND: Automation updated: %s", entity_id)
