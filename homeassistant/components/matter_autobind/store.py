@@ -77,9 +77,15 @@ class EligibilityStatus(StrEnum):
 # =============================================================================
 
 
-def acl_key(target_node_id: int, source_node_id: int, endpoint_id: int = 0) -> str:
-    """Generate a unique key for an ACL resource."""
-    return f"acl:{target_node_id}:{source_node_id}:{endpoint_id}"
+def acl_key(target_node_id: int, source_node_id: int, auth_mode: int = 2) -> str:
+    """Generate a unique key for an ACL resource.
+
+    Args:
+        target_node_id: Node where ACL exists.
+        source_node_id: Node/group granted access (subject).
+        auth_mode: Authentication mode (2=CASE, 3=GROUP).
+    """
+    return f"acl:{target_node_id}:{source_node_id}:{auth_mode}"
 
 
 def binding_key(
@@ -138,7 +144,7 @@ class AclEntryDict(TypedDict):
 
     target_node_id: int
     source_node_id: int
-    endpoint_id: int
+    auth_mode: int
     acl_index: int | None
 
 
@@ -149,10 +155,10 @@ class AclResourceDict(TypedDict):
     """Node where ACL exists."""
 
     source_node_id: int
-    """Node granted access."""
+    """Node/group granted access (subject)."""
 
-    endpoint_id: int
-    """Endpoint (usually 0)."""
+    auth_mode: int
+    """Authentication mode (2=CASE, 3=GROUP)."""
 
     ref_count: int
     """Number of automations using this ACL."""
@@ -627,20 +633,20 @@ class MatterBindingStore:
         automation_id: str,
         target_node_id: int,
         source_node_id: int,
-        endpoint_id: int = 0,
+        auth_mode: int = 2,
     ) -> tuple[str, bool]:
         """Acquire an ACL resource, incrementing ref count or creating new.
 
         Args:
             automation_id: The automation acquiring this resource.
             target_node_id: Node where ACL will be created.
-            source_node_id: Node to grant access to.
-            endpoint_id: Endpoint (usually 0).
+            source_node_id: Node/group to grant access to (subject).
+            auth_mode: Authentication mode (2=CASE, 3=GROUP).
 
         Returns:
             Tuple of (key, is_new) where is_new indicates if resource was created.
         """
-        key = acl_key(target_node_id, source_node_id, endpoint_id)
+        key = acl_key(target_node_id, source_node_id, auth_mode)
         is_new = False
 
         if key in self._data.acl_resources:
@@ -666,7 +672,7 @@ class MatterBindingStore:
             self._data.acl_resources[key] = AclResourceDict(
                 target_node_id=target_node_id,
                 source_node_id=source_node_id,
-                endpoint_id=endpoint_id,
+                auth_mode=auth_mode,
                 ref_count=1,
                 automation_ids=[automation_id],
             )
@@ -974,7 +980,7 @@ class MatterBindingStore:
             automation_id,
             acl_entry["target_node_id"],
             acl_entry["source_node_id"],
-            acl_entry["endpoint_id"],
+            acl_entry["auth_mode"],
         )
         await self.async_save()
 
@@ -1014,7 +1020,7 @@ class MatterBindingStore:
                     AclEntryDict(
                         target_node_id=acl["target_node_id"],
                         source_node_id=acl["source_node_id"],
-                        endpoint_id=acl["endpoint_id"],
+                        auth_mode=acl["auth_mode"],
                         acl_index=None,
                     )
                 )

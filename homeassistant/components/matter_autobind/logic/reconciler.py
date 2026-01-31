@@ -257,7 +257,7 @@ class ResourceReconciler:
                     (
                         acl["target_node_id"],
                         acl["source_node_id"],
-                        acl["endpoint_id"],
+                        acl["auth_mode"],
                     )
                 )
 
@@ -545,6 +545,7 @@ class ResourceReconciler:
                 await self._adapter.remove_acl(
                     acl["target_node_id"],
                     acl["source_node_id"],
+                    acl["auth_mode"],
                 )
 
         # Release groups last
