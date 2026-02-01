@@ -334,7 +334,14 @@ class MatterAdapter:
         fabric_id: int,
         node_id: int,
     ) -> list[Any]:
-        """Clean up duplicate and stale ACL entries.
+        """Clean up duplicate and invalid ACL entries.
+
+        This method only removes:
+        - Invalid entries (missing required fields)
+        - Duplicate entries (same privilege, auth_mode, subjects)
+
+        It preserves all valid ACL entries including Operate ACLs that
+        may have been created by this integration or manually.
 
         Args:
             acl_list: Current ACL entries.
@@ -342,10 +349,10 @@ class MatterAdapter:
             node_id: The node ID (for logging).
 
         Returns:
-            Cleaned ACL list.
+            Cleaned ACL list with duplicates and invalid entries removed.
         """
-        self._logger.warning(
-            "DEBUG_OVERWRITE_ACLS: Cleaning up ACLs on node %d", node_id
+        self._logger.debug(
+            "Cleaning up ACLs on node %d (removing only duplicates/invalid)", node_id
         )
         cleaned_entries: list[dict[str, Any]] = []
         seen_acls: set[tuple[int, int, tuple[int, ...]]] = set()
@@ -381,22 +388,17 @@ class MatterAdapter:
                 )
                 continue
 
-            # Keep controller admin ACL (privilege 5)
-            if privilege == 5:
-                seen_acls.add(sig)
-                cleaned_entries.append(acl_entry)
-                self._logger.debug("Keeping admin ACL: subjects=%s", subjects)
-                continue
-
-            # Remove other Operate ACLs
-            self._logger.info(
-                "Removing stale ACL: privilege=%d, authMode=%d, subjects=%s",
+            # Keep this entry
+            seen_acls.add(sig)
+            cleaned_entries.append(acl_entry)
+            self._logger.debug(
+                "Keeping ACL: privilege=%d, authMode=%d, subjects=%s",
                 privilege,
                 entry_auth_mode,
                 subjects,
             )
 
-        self._logger.info(
+        self._logger.debug(
             "After cleanup, node %d has %d ACL entries", node_id, len(cleaned_entries)
         )
         return cleaned_entries

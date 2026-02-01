@@ -190,6 +190,17 @@ async def test_compute_desired_state_group_preference(
     group_bindings = [b for b in desired.bindings if isinstance(b[2], str)]
     assert len(group_bindings) == 1
 
+    # ACLs should be GROUP only (auth_mode=3), NOT CASE (auth_mode=2)
+    # For group bindings, we only need GROUP ACLs on targets
+    assert len(desired.acls) == 2  # One GROUP ACL per target node
+
+    # All ACLs should be GROUP type (auth_mode=3)
+    for acl in desired.acls:
+        _, subject, auth_mode = acl
+        assert auth_mode == 3, f"Expected GROUP ACL (auth_mode=3), got {auth_mode}"
+        # Subject should be the group ID, not a source node ID
+        assert subject >= 32768, f"Expected group ID, got {subject}"
+
 
 async def test_compute_desired_state_auto_detection(
     hass: HomeAssistant, store: MatterBindingStore

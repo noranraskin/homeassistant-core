@@ -204,15 +204,12 @@ class ResourceReconciler:
             members = frozenset((n.node_id, n.endpoint_id) for n in action_nodes)
             groups.add((group_id, members))
 
-            # ACLs: Each target needs BOTH:
-            # 1. GROUP ACL (authMode=3) for receiving group multicast messages
-            # 2. CASE ACLs (authMode=2) for each source (for unicast fallback/setup)
+            # ACLs: Each target needs GROUP ACL (authMode=3) for receiving
+            # group multicast messages. CASE ACLs are NOT needed for group mode
+            # since the switch sends to the group, not individual nodes.
             for target in action_nodes:
                 # GROUP ACL for group messages
                 acls.add((target.node_id, group_id, 3))
-                # CASE ACLs for each source node
-                for source in trigger_nodes:
-                    acls.add((target.node_id, source.node_id, 2))
 
             # Group bindings for each trigger (source -> group)
             for source in trigger_nodes:

@@ -13,6 +13,7 @@ from homeassistant.config_entries import (
     OptionsFlow,
 )
 from homeassistant.core import callback
+from homeassistant.helpers import selector
 
 from .const import CONF_ENABLE_DEBUG_PANEL, CONF_ENABLE_GROUP_BINDINGS, DOMAIN
 
@@ -42,7 +43,10 @@ class MatterAutoBindConfigFlow(ConfigFlow, domain=DOMAIN):
         return self.async_create_entry(
             title="Matter AutoBind",
             data={},
-            options={CONF_ENABLE_GROUP_BINDINGS: False},  # Default to disabled
+            options={
+                CONF_ENABLE_GROUP_BINDINGS: False,
+                CONF_ENABLE_DEBUG_PANEL: False,
+            },
         )
 
     @staticmethod
@@ -71,13 +75,13 @@ class MatterAutoBindOptionsFlow(OptionsFlow):
                         default=self.config_entry.options.get(
                             CONF_ENABLE_GROUP_BINDINGS, False
                         ),
-                    ): bool,
+                    ): selector.BooleanSelector(),
                     vol.Optional(
                         CONF_ENABLE_DEBUG_PANEL,
                         default=self.config_entry.options.get(
                             CONF_ENABLE_DEBUG_PANEL, False
                         ),
-                    ): bool,
+                    ): selector.BooleanSelector(),
                 }
             ),
         )
