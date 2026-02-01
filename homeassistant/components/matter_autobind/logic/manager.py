@@ -307,6 +307,9 @@ class MatterBindingManager:
         # Subscribe to Matter node events for new device discovery
         self._subscribe_to_matter_node_events()
 
+        # Subscribe to entity registry events for device/entity removal
+        self._subscribe_to_entity_registry_events()
+
         LOGGER.info("Matter AutoBind Manager setup complete")
 
     async def async_shutdown(self) -> None:
@@ -398,6 +401,126 @@ class MatterBindingManager:
         )
         self._unsub_automation_listeners.append(unsub)
         LOGGER.info("Subscribed to Matter node events")
+
+    @callback
+    def _subscribe_to_entity_registry_events(self) -> None:
+        """Subscribe to entity registry events to detect device/entity removal.
+
+        When a Matter entity is removed, we need to clean up any ACLs, bindings,
+        or groups that reference that entity.
+        """
+        LOGGER.debug("Subscribing to entity registry events")
+
+        @callback
+        def handle_entity_registry_updated(
+            event: Event[er.EventEntityRegistryUpdatedData],
+        ) -> None:
+            """Handle entity registry updates."""
+            if event.data["action"] != "remove":
+                return
+
+            entity_id = event.data["entity_id"]
+
+            # Only process Matter entities
+            if not entity_id.startswith(("light.", "switch.", "fan.", "cover.")):
+                return
+
+            # Check if this entity was part of any automation we track
+            # We need to re-reconcile any automations that used this entity
+            self._hass.async_create_task(self._async_handle_entity_removed(entity_id))
+
+        unsub = self._hass.bus.async_listen(
+            er.EVENT_ENTITY_REGISTRY_UPDATED, handle_entity_registry_updated
+        )
+        self._unsub_automation_listeners.append(unsub)
+        LOGGER.info("Subscribed to entity registry events for cleanup on removal")
+
+    async def _async_handle_entity_removed(self, removed_entity_id: str) -> None:
+        """Handle a Matter entity being removed.
+
+        Finds all automations that reference this entity and re-reconciles them.
+        Since the entity no longer exists, the automation will likely become
+        ineligible and its resources will be released.
+
+        Args:
+            removed_entity_id: The entity_id that was removed.
+        """
+        LOGGER.info(
+            "Matter entity removed: %s, checking for affected automations",
+            removed_entity_id,
+        )
+
+        # Find automations that reference this entity by checking eligibility results
+        affected_automations: list[str] = []
+
+        # Iterate over all tracked automations
+        for automation_id in self._store.get_all_tracked_automations():
+            result = self._store.get_eligibility_result(automation_id)
+            if result is None:
+                continue
+
+            # Check trigger entities
+            trigger_entities = result.get("trigger_entities", [])
+            action_entities = result.get("action_entities", [])
+
+            if (
+                removed_entity_id in trigger_entities
+                or removed_entity_id in action_entities
+            ):
+                affected_automations.append(automation_id)
+                LOGGER.info(
+                    "Automation %s uses removed entity %s",
+                    automation_id,
+                    removed_entity_id,
+                )
+
+        # Re-analyze and reconcile affected automations
+        for automation_id in affected_automations:
+            LOGGER.info(
+                "Re-analyzing automation %s after entity removal", automation_id
+            )
+
+            # Re-analyze the automation (it may now be ineligible)
+            analysis = await self._analyzer.analyze(automation_id)
+
+            if analysis is None or not analysis.eligible:
+                # Automation is no longer eligible - release its resources
+                reason = analysis.reason.value if analysis else "unknown"
+                LOGGER.info(
+                    "Automation %s is no longer eligible after entity %s removed "
+                    "(reason: %s), releasing resources",
+                    automation_id,
+                    removed_entity_id,
+                    reason,
+                )
+                await self._reconciler.release_all_resources(automation_id)
+                await self._store.async_clear_scanned_automation(automation_id)
+
+                # Unsubscribe from trigger entities
+                for trigger_entity_id, auto_id in list(
+                    self._trigger_to_automation.items()
+                ):
+                    if auto_id == automation_id:
+                        self._unsubscribe_from_trigger_entity(trigger_entity_id)
+            else:
+                # Automation is still eligible but with different entities
+                # Re-reconcile with the new entity set
+                LOGGER.info(
+                    "Automation %s still eligible, re-reconciling with updated entities",
+                    automation_id,
+                )
+                await self._store.async_set_eligibility_result(
+                    automation_id,
+                    EligibilityStatus.ELIGIBLE,
+                    analysis.trigger_entities,
+                    analysis.action_entities,
+                    analysis.reason.value,
+                )
+                await self._reconcile_automation_resources(
+                    automation_id,
+                    analysis.trigger_entities,
+                    analysis.action_entities,
+                )
 
     @callback
     def _handle_automation_added(self, event: Event[EventStateChangedData]) -> None:

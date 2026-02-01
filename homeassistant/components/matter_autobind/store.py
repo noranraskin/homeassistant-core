@@ -404,6 +404,14 @@ class MatterBindingStore:
         """Check if an automation has already been scanned."""
         return automation_id in self._data.scanned_automation_ids
 
+    def get_all_tracked_automations(self) -> list[str]:
+        """Get all automation IDs that have eligibility results.
+
+        Returns:
+            List of automation IDs that have been analyzed and have results.
+        """
+        return list(self._data.eligibility_results.keys())
+
     def get_eligibility_result(
         self, automation_id: str
     ) -> EligibilityResultDict | None:
