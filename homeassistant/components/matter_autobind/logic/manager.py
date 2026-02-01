@@ -295,6 +295,17 @@ class MatterBindingManager:
         self._entity_registry = er.async_get(self._hass)
         self._device_registry = dr.async_get(self._hass)
 
+        # Purge stale automations from store (automations that were deleted
+        # while the integration was not running)
+        existing_automations = set(
+            self._hass.states.async_entity_ids(AUTOMATION_DOMAIN)
+        )
+        purged_count = await self._store.async_purge_stale_automations(
+            existing_automations
+        )
+        if purged_count > 0:
+            LOGGER.info("Purged %d stale automations from store", purged_count)
+
         # Re-initialize analyzer with registries now that they are loaded
         self._analyzer = AutomationAnalyzer(
             self._hass, self._entity_registry, self._device_registry, LOGGER
@@ -1463,9 +1474,31 @@ class MatterBindingManager:
 
         if not trigger_nodes or not action_nodes:
             LOGGER.warning(
-                "Could not get node info for automation %s entities",
+                "Could not get node info for automation %s entities "
+                "(triggers=%d, actions=%d) - releasing resources",
                 automation_id,
+                len(trigger_nodes),
+                len(action_nodes),
             )
+            # Release all resources since we can't reconcile
+            await self._reconciler.release_all_resources(automation_id)
+            return
+
+        # Check for self-bindings (trigger and action are the same node)
+        # This is invalid - a device cannot bind to itself
+        trigger_node_ids = {n.node_id for n in trigger_nodes}
+        action_node_ids = {n.node_id for n in action_nodes}
+        overlapping_nodes = trigger_node_ids & action_node_ids
+
+        if overlapping_nodes:
+            LOGGER.warning(
+                "Automation %s has self-referencing nodes %s "
+                "(trigger and action on same device) - releasing resources",
+                automation_id,
+                overlapping_nodes,
+            )
+            # Release all resources - this automation is now invalid
+            await self._reconciler.release_all_resources(automation_id)
             return
 
         # Get current state

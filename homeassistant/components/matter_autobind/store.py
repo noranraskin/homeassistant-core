@@ -412,6 +412,53 @@ class MatterBindingStore:
         """
         return list(self._data.eligibility_results.keys())
 
+    async def async_purge_stale_automations(
+        self, existing_automation_ids: set[str]
+    ) -> int:
+        """Remove automations that no longer exist from the store.
+
+        Args:
+            existing_automation_ids: Set of automation IDs that currently exist.
+
+        Returns:
+            Number of stale automations removed.
+        """
+        stale_ids: set[str] = set()
+
+        # Check eligibility results
+        for automation_id in list(self._data.eligibility_results.keys()):
+            if automation_id not in existing_automation_ids:
+                stale_ids.add(automation_id)
+
+        # Check scanned automations
+        for automation_id in list(self._data.scanned_automation_ids):
+            if automation_id not in existing_automation_ids:
+                stale_ids.add(automation_id)
+
+        # Check automation resources
+        for automation_id in list(self._data.automation_resources.keys()):
+            if automation_id not in existing_automation_ids:
+                stale_ids.add(automation_id)
+
+        # Check binding preferences
+        for automation_id in list(self._data.binding_preferences.keys()):
+            if automation_id not in existing_automation_ids:
+                stale_ids.add(automation_id)
+
+        if not stale_ids:
+            return 0
+
+        # Remove stale automations
+        for automation_id in stale_ids:
+            self._data.scanned_automation_ids.discard(automation_id)
+            self._data.eligibility_results.pop(automation_id, None)
+            self._data.automation_resources.pop(automation_id, None)
+            self._data.binding_preferences.pop(automation_id, None)
+            LOGGER.info("Purged stale automation from store: %s", automation_id)
+
+        await self.async_save()
+        return len(stale_ids)
+
     def get_eligibility_result(
         self, automation_id: str
     ) -> EligibilityResultDict | None:
@@ -449,10 +496,34 @@ class MatterBindingStore:
             await self.async_save()
 
     async def async_clear_scanned_automation(self, automation_id: str) -> None:
-        """Remove an automation from the scanned set."""
+        """Remove an automation completely from tracking.
+
+        This clears:
+        - Scanned status
+        - Eligibility results
+        - Binding preferences
+        - Automation resources mapping (note: doesn't release actual resources)
+        """
+        changed = False
+
         if automation_id in self._data.scanned_automation_ids:
             self._data.scanned_automation_ids.discard(automation_id)
-            LOGGER.debug("Cleared scanned status for automation %s", automation_id)
+            changed = True
+
+        if automation_id in self._data.eligibility_results:
+            del self._data.eligibility_results[automation_id]
+            changed = True
+
+        if automation_id in self._data.binding_preferences:
+            del self._data.binding_preferences[automation_id]
+            changed = True
+
+        if automation_id in self._data.automation_resources:
+            del self._data.automation_resources[automation_id]
+            changed = True
+
+        if changed:
+            LOGGER.debug("Cleared all tracking data for automation %s", automation_id)
             await self.async_save()
 
     # =========================================================================

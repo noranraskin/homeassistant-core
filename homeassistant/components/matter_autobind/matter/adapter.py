@@ -79,6 +79,17 @@ class MatterAdapter:
         except (RuntimeError, AttributeError):
             return None
 
+    def node_exists(self, node_id: int) -> bool:
+        """Check if a node exists in the Matter fabric.
+
+        Args:
+            node_id: The node ID to check.
+
+        Returns:
+            True if the node exists, False otherwise.
+        """
+        return self._get_node(node_id) is not None
+
     def _get_binding_endpoint(self, node_id: int, source_endpoint: int) -> int:
         """Get the endpoint ID that has the Binding cluster.
 

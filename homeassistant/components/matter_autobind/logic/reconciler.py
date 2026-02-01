@@ -307,6 +307,14 @@ class ResourceReconciler:
         to_remove = current - desired
 
         for target_node, subject, auth_mode in to_add:
+            # Skip if target node doesn't exist anymore
+            if not self._adapter.node_exists(target_node):
+                self._logger.warning(
+                    "Skipping ACL add for node %d - node no longer exists",
+                    target_node,
+                )
+                continue
+
             key, is_new = self._store.acquire_acl(
                 automation_id, target_node, subject, auth_mode
             )
@@ -321,8 +329,15 @@ class ResourceReconciler:
             key = acl_key(target_node, subject, auth_mode)
             should_remove = self._store.release_acl(automation_id, key)
             if should_remove:
-                # Actually remove ACL from device
-                await self._adapter.remove_acl(target_node, subject, auth_mode)
+                # Skip removal from device if node doesn't exist anymore
+                if not self._adapter.node_exists(target_node):
+                    self._logger.debug(
+                        "Skipping ACL removal from node %d - node no longer exists",
+                        target_node,
+                    )
+                else:
+                    # Actually remove ACL from device
+                    await self._adapter.remove_acl(target_node, subject, auth_mode)
             self._logger.debug("Released ACL %s (removed=%s)", key, should_remove)
 
     async def reconcile_bindings(
@@ -340,6 +355,14 @@ class ResourceReconciler:
         to_remove = current - desired
 
         for source_node, source_ep, target, target_ep in to_add:
+            # Skip if source node doesn't exist anymore
+            if not self._adapter.node_exists(source_node):
+                self._logger.warning(
+                    "Skipping binding add for node %d - node no longer exists",
+                    source_node,
+                )
+                continue
+
             key, is_new = self._store.acquire_binding(
                 automation_id, source_node, source_ep, target, target_ep
             )
@@ -359,10 +382,17 @@ class ResourceReconciler:
             key = binding_key(source_node, source_ep, target, target_ep)
             should_remove = self._store.release_binding(automation_id, key)
             if should_remove:
-                # Actually remove binding from device
-                await self._adapter.remove_binding(
-                    source_node, source_ep, target, target_ep
-                )
+                # Skip removal from device if node doesn't exist anymore
+                if not self._adapter.node_exists(source_node):
+                    self._logger.debug(
+                        "Skipping binding removal from node %d - node no longer exists",
+                        source_node,
+                    )
+                else:
+                    # Actually remove binding from device
+                    await self._adapter.remove_binding(
+                        source_node, source_ep, target, target_ep
+                    )
             self._logger.debug("Released binding %s (removed=%s)", key, should_remove)
 
     async def reconcile_groups(
