@@ -101,6 +101,11 @@ class MatterBindingManager:
         # Track automations currently being suppressed (temporary disable)
         # Used to prevent binding removal when we temporarily disable automation
         self._suppressing_automations: set[str] = set()
+        # Track automations currently being processed to prevent duplicate handling
+        # This prevents race conditions when HA emits multiple events for the same update
+        self._processing_automations: set[str] = set()
+        # Lock for automation processing to serialize updates to the same automation
+        self._automation_locks: dict[str, asyncio.Lock] = {}
         # Matter adapter for ACL/binding operations
         self._adapter = MatterAdapter(
             hass, LOGGER, debug_overwrite_acls=DEBUG_OVERWRITE_ACLS
@@ -641,13 +646,21 @@ class MatterBindingManager:
                 # )
                 return
 
+        # Check if this automation is already being processed (duplicate event)
+        if entity_id in self._processing_automations:
+            LOGGER.debug(
+                "Automation %s is already being processed, skipping duplicate event",
+                entity_id,
+            )
+            return
+
         LOGGER.info("=" * 60)
         LOGGER.info("MATTER AUTOBIND: Automation updated: %s", entity_id)
         LOGGER.info("=" * 60)
 
-        # Schedule the eligibility check (needs to be async)
+        # Schedule the eligibility check with locking (needs to be async)
         self._hass.async_create_task(
-            self._async_check_and_log_automation(entity_id, is_new=False)
+            self._async_check_and_log_automation_locked(entity_id, is_new=False)
         )
 
     async def _async_handle_automation_deleted(self, automation_id: str) -> None:
@@ -720,6 +733,41 @@ class MatterBindingManager:
         await self._reconcile_automation_resources(
             automation_id, trigger_entities, action_entities
         )
+
+    async def _async_check_and_log_automation_locked(
+        self, automation_id: str, is_new: bool
+    ) -> None:
+        """Wrapper that ensures only one update runs at a time per automation.
+
+        This prevents race conditions when Home Assistant emits multiple
+        state change events for the same automation update.
+
+        Args:
+            automation_id: The entity_id of the automation to check.
+            is_new: True if this is a newly created automation.
+        """
+        # Get or create lock for this automation
+        if automation_id not in self._automation_locks:
+            self._automation_locks[automation_id] = asyncio.Lock()
+
+        lock = self._automation_locks[automation_id]
+
+        # Check if already processing (double-check after getting lock)
+        if automation_id in self._processing_automations:
+            LOGGER.debug(
+                "Automation %s update already in progress, skipping",
+                automation_id,
+            )
+            return
+
+        async with lock:
+            # Mark as processing
+            self._processing_automations.add(automation_id)
+            try:
+                await self._async_check_and_log_automation(automation_id, is_new)
+            finally:
+                # Clear processing flag
+                self._processing_automations.discard(automation_id)
 
     async def _async_check_and_log_automation(
         self, automation_id: str, is_new: bool

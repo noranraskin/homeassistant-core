@@ -313,12 +313,14 @@ class GroupManager:
         self,
         group_id: int,
         members: frozenset[tuple[int, int]],
+        source_node_ids: set[int] | None = None,
     ) -> None:
         """Remove a group completely from all devices (targets AND sources).
 
         Args:
             group_id: The group ID to remove.
             members: The target members (node_id, endpoint_id).
+            source_node_ids: The source node IDs (if not provided, tries to get from store).
         """
         try:
             matter_client = self._get_matter_client()
@@ -326,12 +328,13 @@ class GroupManager:
             self._logger.warning("Matter integration not available for group removal")
             return
 
-        # Get source nodes from store
-        key = group_key(group_id)
-        group_resource = self._store.get_group_resource(key)
-        source_node_ids = (
-            set(group_resource.get("source_nodes", [])) if group_resource else set()
-        )
+        # Get source nodes from parameter or fall back to store
+        if source_node_ids is None:
+            key = group_key(group_id)
+            group_resource = self._store.get_group_resource(key)
+            source_node_ids = (
+                set(group_resource.get("source_nodes", [])) if group_resource else set()
+            )
 
         self._logger.info(
             "Removing group %d completely: %d targets, %d sources",

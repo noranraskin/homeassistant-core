@@ -433,11 +433,18 @@ class ResourceReconciler:
                     gid,
                     len(desired_members),
                 )
+                # Get source nodes BEFORE releasing (release deletes from store)
+                group_resource = self._store.get_group_resource(key)
+                source_node_ids = (
+                    set(group_resource.get("source_nodes", []))
+                    if group_resource
+                    else set()
+                )
                 should_remove = self._store.release_group(automation_id, key)
                 if should_remove:
                     # Remove from all devices (targets AND sources)
                     await self._group_manager.remove_group_completely(
-                        gid, current_members
+                        gid, current_members, source_node_ids
                     )
                 continue
 
@@ -494,11 +501,18 @@ class ResourceReconciler:
         # Groups to remove (no longer needed)
         for gid in current_by_id.keys() - desired_by_id.keys():
             key = group_key(gid)
+            # Get source nodes BEFORE releasing (release deletes from store)
+            group_resource = self._store.get_group_resource(key)
+            source_node_ids = (
+                set(group_resource.get("source_nodes", [])) if group_resource else set()
+            )
             should_remove = self._store.release_group(automation_id, key)
             if should_remove:
                 # Remove from all devices (targets AND sources)
                 members = current_by_id[gid]
-                await self._group_manager.remove_group_completely(gid, members)
+                await self._group_manager.remove_group_completely(
+                    gid, members, source_node_ids
+                )
             self._logger.debug("Released group %s (removed=%s)", key, should_remove)
 
     # =========================================================================
