@@ -5,8 +5,7 @@
     },
     "step": {
       "user": {
-        "description": "This will set up Matter AutoBind to automatically create entities for Matter devices with client clusters and manage device bindings from your automations.",
-        "title": "Matter AutoBind"
+        "description": "This will set up Matter AutoBind to automatically create entities for Matter devices with client clusters and manage device bindings from your automations."
       }
     }
   },
